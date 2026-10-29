@@ -495,6 +495,26 @@ fn default_frame_rate() -> String {
     "30".into()
 }
 
+// "30" and "60" are the 0.2.0 modes. The unlocked rates only take effect with
+// a runtime that has the title's scheduler-floor hook; until then the runtime
+// runs them as the 60 FPS mode.
+const UNLOCKED_FRAME_RATES: [&str; 4] = ["120", "144", "165", "uncapped"];
+
+fn valid_frame_rate(frame_rate: &str) -> bool {
+    matches!(frame_rate, "30" | "60") || UNLOCKED_FRAME_RATES.contains(&frame_rate)
+}
+
+// MOJORECOMP_FRAME_RATE and MOJORECOMP_FRAME_RATE_TARGET for a launch. An
+// unlocked rate is passed as 60 plus a target so a runtime that predates the
+// unlocked modes degrades to its 60 FPS mode instead of the 30 FPS fallback.
+fn runtime_frame_rate_environment(frame_rate: &str) -> (&str, Option<&str>) {
+    if UNLOCKED_FRAME_RATES.contains(&frame_rate) {
+        ("60", Some(frame_rate))
+    } else {
+        (frame_rate, None)
+    }
+}
+
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
@@ -2859,8 +2879,8 @@ fn save_settings(
     if settings.schema_version != 1 || !(1..=3).contains(&settings.display.resolution_scale) {
         return Err("Unsupported settings schema or resolution scale".into());
     }
-    if !matches!(settings.graphics.frame_rate.as_str(), "30" | "60") {
-        return Err("Frame rate must be 30 or 60".into());
+    if !valid_frame_rate(&settings.graphics.frame_rate) {
+        return Err("Frame rate must be 30, 60, 120, 144, 165 or uncapped".into());
     }
     validate_localization_settings(&game_id, &settings.localization)?;
     let path = settings_path(&game_id)?;
@@ -3262,11 +3282,14 @@ fn launch_game(
         .env("MOJORECOMP_UTILITY_ROOT", utility_root(&game_id)?)
         .env("MOJORECOMP_LOG_ROOT", game_log_root(&game_id)?)
         .env("MOJORECOMP_RUNTIME_SHA256", &runtime_sha256)
-        .env(
-            "MOJORECOMP_FRAME_RATE",
-            &runtime_settings.graphics.frame_rate,
-        )
         .stdin(Stdio::null());
+    let (frame_rate, frame_rate_target) =
+        runtime_frame_rate_environment(&runtime_settings.graphics.frame_rate);
+    command.env("MOJORECOMP_FRAME_RATE", frame_rate);
+    match frame_rate_target {
+        Some(target) => command.env("MOJORECOMP_FRAME_RATE_TARGET", target),
+        None => command.env_remove("MOJORECOMP_FRAME_RATE_TARGET"),
+    };
     if let Some(overlay) = localization_overlay {
         command.arg("--game-overlay").arg(overlay);
     }
@@ -6281,6 +6304,28 @@ mod tests {
         assert_eq!(restored.graphics.texture_filtering, "16x");
         assert_eq!(restored.graphics.frame_rate, "60");
         assert!(!restored.advanced.logging_enabled);
+    }
+
+    #[test]
+    fn frame_rate_settings_accept_unlocked_rates_and_degrade_to_60() {
+        for value in ["30", "60", "120", "144", "165", "uncapped"] {
+            assert!(valid_frame_rate(value), "{value} should be accepted");
+        }
+        for value in ["", "0", "59", "61", "90", "240", "300", "Uncapped", "60 "] {
+            assert!(!valid_frame_rate(value), "{value} should be rejected");
+        }
+
+        assert_eq!(runtime_frame_rate_environment("30"), ("30", None));
+        assert_eq!(runtime_frame_rate_environment("60"), ("60", None));
+        for value in UNLOCKED_FRAME_RATES {
+            assert_eq!(runtime_frame_rate_environment(value), ("60", Some(value)));
+        }
+
+        let mut settings = RuntimeSettings::default();
+        settings.graphics.frame_rate = "144".into();
+        let serialized = toml::to_string_pretty(&settings).expect("serialize settings");
+        let restored: RuntimeSettings = toml::from_str(&serialized).expect("parse settings");
+        assert_eq!(restored.graphics.frame_rate, "144");
     }
 
     #[test]

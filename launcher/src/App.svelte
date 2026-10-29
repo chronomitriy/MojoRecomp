@@ -1624,7 +1624,7 @@
                   <div class="field-grid">
                     <label><span>Anti-aliasing</span><select bind:value={settings.graphics.anti_aliasing} disabled={navigationLocked}><option value="off">Off</option><option value="fxaa">FXAA</option><option value="fxaa_extreme">FXAA Extreme</option></select></label>
                     <label><span>Texture filtering</span><select bind:value={settings.graphics.texture_filtering} disabled={navigationLocked}><option value="default">Default</option><option value="1x">1x</option><option value="2x" disabled={filteringDisabled(2)}>2x</option><option value="4x" disabled={filteringDisabled(4)}>4x</option><option value="8x" disabled={filteringDisabled(8)}>8x</option><option value="16x" disabled={filteringDisabled(16)}>16x</option></select></label>
-                    <label><span>Frame rate</span><select bind:value={settings.graphics.frame_rate} disabled={navigationLocked}><option value="30">30 FPS</option><option value="60">30+ FPS (Experimental)</option></select></label>
+                    <label><span>Frame rate</span><select bind:value={settings.graphics.frame_rate} disabled={navigationLocked}><option value="30">30 FPS</option><option value="60">30+ FPS (Experimental)</option><option value="120">120 FPS (Unlocked, Experimental)</option><option value="144">144 FPS (Unlocked, Experimental)</option><option value="165">165 FPS (Unlocked, Experimental)</option><option value="uncapped">Uncapped (Unlocked, Experimental)</option></select></label>
                   </div>
                 </section>
 

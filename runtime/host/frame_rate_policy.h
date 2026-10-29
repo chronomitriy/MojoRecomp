@@ -109,6 +109,18 @@ constexpr FrameRatePolicy PolicyForSetting(std::string_view value) noexcept
     return PolicyFor(FrameRateModeForSetting(value));
 }
 
+// The launcher passes an unlocked choice as MOJORECOMP_FRAME_RATE=60 plus
+// MOJORECOMP_FRAME_RATE_TARGET=<rate>, so a runtime without unlocked support
+// degrades to the 60 FPS mode instead of the 30 FPS fallback. A direct
+// MOJORECOMP_FRAME_RATE=<rate> is accepted as well.
+constexpr FrameRatePolicy PolicyForSettings(std::string_view setting,
+                                            std::string_view target) noexcept
+{
+    if (setting == "60" && UnlockedRateHzForSetting(target))
+        return PolicyForSetting(target);
+    return PolicyForSetting(setting);
+}
+
 constexpr const char* FrameRateModeName(FrameRateMode mode) noexcept
 {
     switch (mode)
@@ -128,7 +140,8 @@ inline FrameRatePolicy ActiveFrameRatePolicy() noexcept
 {
     static const FrameRatePolicy policy = [] {
         const char* setting = std::getenv("MOJORECOMP_FRAME_RATE");
-        return PolicyForSetting(setting ? setting : "");
+        const char* target = std::getenv("MOJORECOMP_FRAME_RATE_TARGET");
+        return PolicyForSettings(setting ? setting : "", target ? target : "");
     }();
     return policy;
 }

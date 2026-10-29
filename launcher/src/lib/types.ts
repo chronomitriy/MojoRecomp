@@ -36,7 +36,7 @@ export type Settings = {
   graphics: {
     anti_aliasing: "off" | "fxaa" | "fxaa_extreme";
     texture_filtering: "default" | "1x" | "2x" | "4x" | "8x" | "16x";
-    frame_rate: "30" | "60";
+    frame_rate: "30" | "60" | "120" | "144" | "165" | "uncapped";
   };
   advanced: {
     logging_enabled: boolean;

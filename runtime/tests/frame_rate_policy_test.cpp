@@ -196,6 +196,7 @@ int main()
     using mojorecomp::host::PeriodForHzRoundedUs;
     using mojorecomp::host::PolicyFor;
     using mojorecomp::host::PolicyForSetting;
+    using mojorecomp::host::PolicyForSettings;
     using mojorecomp::host::TitleAsyncPollShouldYield;
     using mojorecomp::host::TitleFrameGateElapsedUs;
     using mojorecomp::host::TitleFrameGateElapsedUsPhased;
@@ -291,6 +292,8 @@ int main()
         {
             if (UnlockedRateHzForSetting(setting))
                 return Fail("a 0.2.0 setting value was reinterpreted as an unlocked rate");
+            if (!SamePolicy(PolicyForSettings(setting, ""), PolicyForSetting(setting)))
+                return Fail("an empty frame-rate target changed a 0.2.0 setting value");
             if (FrameRateModeForSetting(setting) != reference::FrameRateModeForSetting(setting) ||
                 !SamePolicy(PolicyForSetting(setting),
                             reference::PolicyFor(reference::FrameRateModeForSetting(setting))))
@@ -418,6 +421,18 @@ int main()
             if (UnlockedRateHzForSetting(rejected) ||
                 PolicyForSetting(rejected).mode != FrameRateMode::Compatibility30)
                 return Fail("an invalid unlocked value did not fall back to 30 FPS");
+
+        // Launcher form: 60 plus a target. A target never changes 30 or a
+        // non-unlocked value, and an invalid target leaves the 60 FPS mode.
+        if (!SamePolicy(PolicyForSettings("60", "144"), PolicyForSetting("144")) ||
+            !SamePolicy(PolicyForSettings("60", "uncapped"), PolicyForSetting("uncapped")) ||
+            !SamePolicy(PolicyForSettings("120", ""), PolicyForSetting("120")) ||
+            !SamePolicy(PolicyForSettings("60", ""), PolicyFor(FrameRateMode::HighFrameRate60)) ||
+            !SamePolicy(PolicyForSettings("60", "bogus"), PolicyFor(FrameRateMode::HighFrameRate60)) ||
+            !SamePolicy(PolicyForSettings("60", "60"), PolicyFor(FrameRateMode::HighFrameRate60)) ||
+            !SamePolicy(PolicyForSettings("30", "144"), PolicyFor(FrameRateMode::Compatibility30)) ||
+            !SamePolicy(PolicyForSettings("", "144"), PolicyFor(FrameRateMode::Compatibility30)))
+            return Fail("MOJORECOMP_FRAME_RATE_TARGET is not limited to the 60 FPS setting");
 
         const auto u144 = PolicyForSetting("144");
         // Until the scheduler floor is lifted an unlocked request is exactly 60.
