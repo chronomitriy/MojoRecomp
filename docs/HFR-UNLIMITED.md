@@ -270,14 +270,14 @@ git submodule update --init --recursive
 
 ### 4.3 Provide your own default.xex
 
-`config\CrashOfTheTitans.toml` reads `..\game\default.xex`, which is `game\default.xex` in the repository. The `game\` folder is git-ignored. Never commit it.
+`config\CrashOfTheTitans.toml` reads `..\game\default.xex`, which is `game\default.xex` in the repository. The `game\` folder is git-ignored. Never commit it. `%USERPROFILE%\Games\MojoRecomp-Games\cot` below is the launcher's default library folder; use your own path if you moved the library.
 
 ```bat
 mkdir game
 ```
 
 ```bat
-copy "C:\Users\ondrf\Games\MojoRecomp-Games\cot\default.xex" game\default.xex
+copy "%USERPROFILE%\Games\MojoRecomp-Games\cot\default.xex" game\default.xex
 ```
 
 ### 4.4 Toolchain, recompile, build
@@ -304,7 +304,7 @@ build-smoke.bat
 The launcher's **Versions > Install Runtime from ZIP** verifies an ed25519 signature made with the official release key (`updates.rs:882`). It would reject a self-built ZIP. Overwriting the installed runtime's files would fail the launcher's hash check. Instead:
 
 ```bat
-tools\run-custom-runtime.bat "C:\Users\ondrf\Games\MojoRecomp-Games\cot" 60
+tools\run-custom-runtime.bat "%USERPROFILE%\Games\MojoRecomp-Games\cot" 60
 ```
 
 - It uses the same command line as the launcher (`--cpu --config … --game-root …`).
@@ -361,7 +361,7 @@ For the benchmark, use the `pipelines=` and `modules=` counts from your `Vulkan 
    ```
 
    ```bat
-   tools\run-custom-runtime.bat "C:\Users\ondrf\Games\MojoRecomp-Games\cot" 60
+   tools\run-custom-runtime.bat "%USERPROFILE%\Games\MojoRecomp-Games\cot" 60
    ```
 
 4. If the guest is still the limit, add these in a `cmd` window before running:
@@ -385,7 +385,7 @@ For the benchmark, use the `pipelines=` and `modules=` counts from your `Vulkan 
    ```
 
    ```bat
-   tools\run-custom-runtime.bat "C:\Users\ondrf\Games\MojoRecomp-Games\cot" 60
+   tools\run-custom-runtime.bat "%USERPROFILE%\Games\MojoRecomp-Games\cot" 60
    ```
 
 2. Pick the candidate (see [3.5](#35-finding-the-floor-on-your-pc)). Add its `[[midasm_hook]]` block to `config\CrashOfTheTitans.toml` after the `MojoRecompHfrYieldAsyncPoll` hooks, then rebuild:
@@ -405,7 +405,7 @@ For the benchmark, use the `pipelines=` and `modules=` counts from your `Vulkan 
    ```
 
    ```bat
-   tools\run-custom-runtime.bat "C:\Users\ondrf\Games\MojoRecomp-Games\cot" 120
+   tools\run-custom-runtime.bat "%USERPROFILE%\Games\MojoRecomp-Games\cot" 120
    ```
 
 4. G-Sync: enable it in the NVIDIA Control Panel for windowed and full-screen mode, and use **Borderless fullscreen** in the launcher. Leave the launcher's VSync off and keep the cap a few FPS under 165, so `162` or `144`. With VSync off, frames at or above the refresh rate tear.
