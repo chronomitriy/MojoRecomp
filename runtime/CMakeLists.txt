@@ -118,6 +118,11 @@ if(BUILD_TESTING)
     add_executable(MojoRecompFrameRatePolicyTest tests/frame_rate_policy_test.cpp)
     add_test(NAME FrameRatePolicy COMMAND MojoRecompFrameRatePolicyTest)
     set_tests_properties(FrameRatePolicy PROPERTIES TIMEOUT 10 LABELS "host;timing")
+    add_executable(MojoRecompPpcConstantScanTest
+        tests/ppc_constant_scan_test.cpp
+        cpu/ppc_constant_scan.cpp)
+    add_test(NAME PpcConstantScan COMMAND MojoRecompPpcConstantScanTest)
+    set_tests_properties(PpcConstantScan PROPERTIES TIMEOUT 10 LABELS "cpu;timing")
     add_executable(MojoRecompTimingTest tests/timing_test.cpp)
     add_test(NAME HostTiming COMMAND MojoRecompTimingTest)
     set_tests_properties(HostTiming PROPERTIES TIMEOUT 10 LABELS "host;timing")
@@ -414,6 +419,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     subtitles/dialogue_catalog.cpp
     subtitles/subtitle_runtime.cpp
     cpu/timebase.cpp
+    cpu/ppc_constant_scan.cpp
     cpu/guest_thread.cpp
     cpu/guest_fiber.cpp
     runtime_state.cpp
