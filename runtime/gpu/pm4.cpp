@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "../host/pipeline_metrics.h"
 #include "../kernel/klog.h"
 #include "xenos.h"
 
@@ -255,6 +256,18 @@ struct StallPlan {
 StallPlan g_resumePlan{};
 StallPlan g_nextPlan{};
 bool g_stallHit = false;
+
+// Duration of the current WAIT_REG_MEM stall episode (PM4 thread only). The
+// episode is attributed to a guest vblank when one was delivered between the
+// last failing poll and the poll that finally passed.
+struct WaitStallTiming
+{
+    bool active = false;
+    uint32_t packetVa = 0;
+    std::chrono::steady_clock::time_point start{};
+    uint64_t vblankAtLastFail = 0;
+};
+WaitStallTiming g_waitStallTiming;
 
 inline uint32_t GuestLoad32(const uint8_t* base, uint32_t address)
 {
@@ -924,8 +937,17 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                     value = reg < kRegisterCount ? g_registers[reg] : 0;
                 }
 
+                const uint32_t waitPacketVa = fetch.va + position * 4u;
                 if (!EvalWaitCondition(info, value, mask, ref))
                 {
+                    auto& timing = g_waitStallTiming;
+                    if (!timing.active || timing.packetVa != waitPacketVa)
+                    {
+                        timing.active = true;
+                        timing.packetVa = waitPacketVa;
+                        timing.start = std::chrono::steady_clock::now();
+                    }
+                    timing.vblankAtLastFail = mojorecomp::host::GuestVblankSequence();
                     const uint64_t n = ++g_waitStalls;
                     if (n <= 8 && MojoRecompVerboseDiagnosticsEnabled())
                     {
@@ -941,6 +963,15 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                     }
                     NoteStall(fetch, position, depth);
                     return 0;
+                }
+                if (g_waitStallTiming.active && g_waitStallTiming.packetVa == waitPacketVa)
+                {
+                    g_waitStallTiming.active = false;
+                    mojorecomp::host::NotePm4Stall(
+                        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - g_waitStallTiming.start).count()),
+                        mojorecomp::host::GuestVblankSequence() !=
+                            g_waitStallTiming.vblankAtLastFail);
                 }
             }
             break;

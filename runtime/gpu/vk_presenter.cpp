@@ -880,6 +880,8 @@ bool UiDiagnosticsEnabled()
     return enabled;
 }
 
+uint64_t g_hotkeyTracedFrame = 0;
+
 bool TraceDrawFrame(uint64_t frame)
 {
     static const uint64_t requestedFrame = [] {
@@ -906,7 +908,14 @@ bool TraceDrawFrame(uint64_t frame)
             return true;
     }
 
-    static uint64_t tracedFrame = 0;
+    return g_hotkeyTracedFrame == frame;
+}
+
+// F12 arms a one-frame draw trace. TraceDrawFrame runs for every draw,
+// resolve and dispatch, so the Win32 key-state query (a kernel transition)
+// is made once per presented frame here instead of on that hot path.
+void PollDrawTraceHotkey(uint64_t frame)
+{
     static bool keyWasDown = false;
     const bool keyDown = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
     if (keyDown && !keyWasDown)
@@ -914,12 +923,11 @@ bool TraceDrawFrame(uint64_t frame)
         // Input is sampled while the current guest frame is already being
         // submitted. Trace the following frame so the capture always starts
         // before its first draw/resolve instead of producing a partial frame.
-        tracedFrame = frame + 1;
+        g_hotkeyTracedFrame = frame + 1;
         KLOG("[draw frame] armed frame=%llu\n",
-             static_cast<unsigned long long>(tracedFrame));
+             static_cast<unsigned long long>(g_hotkeyTracedFrame));
     }
     keyWasDown = keyDown;
-    return tracedFrame == frame;
 }
 
 bool EdramOwnershipPairProfileEnabled()
@@ -1518,6 +1526,8 @@ struct ShaderModuleRec
     bool usesAlu = true;
     uint32_t colorOutputMask = 0;
     bool writesDepth = false;
+    // AttributeLayoutHash(*this), fixed once the metadata is populated.
+    uint64_t attributeLayoutHash = 0;
 };
 
 struct PipelineRec
@@ -1543,7 +1553,13 @@ struct PipelineRec
 // deque keeps those references stable; a vector invalidated the first VS pointer when
 // the PS was inserted and produced a bogus hash in the very first pipeline key.
 std::deque<ShaderModuleRec> g_modules;
+// GetModule runs twice per draw and GetPipeline once. Index both by key
+// instead of scanning every translated module and every pipeline, including
+// the ones prewarmed from the on-disk manifest. Deque elements never move;
+// pipelines are indexed by position because the vector may reallocate.
+std::array<std::unordered_map<uint64_t, ShaderModuleRec*>, 2> g_moduleIndex;
 std::vector<PipelineRec> g_pipelines;
+std::unordered_multimap<uint64_t, size_t> g_pipelineIndex;
 std::mutex g_pipelineMutex;
 VkPipelineCache g_pipelineCache = VK_NULL_HANDLE;
 VkPipelineCache g_pipelinePrewarmCache = VK_NULL_HANDLE;
@@ -1811,6 +1827,30 @@ bool SamePipelineKey(const PipelineRec& a, const PipelineRec& b)
            a.mode == b.mode && a.primitiveRestart == b.primitiveRestart &&
            a.samples == b.samples && a.depthFormat == b.depthFormat &&
            a.layoutHash == b.layoutHash;
+}
+
+// Covers exactly the fields SamePipelineKey compares.
+uint64_t PipelineKeyHash(const PipelineRec& p)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    const auto mix = [&h](uint64_t value) {
+        h ^= value + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    };
+    mix(p.vs);
+    mix(p.ps);
+    mix(p.prim);
+    mix(p.colorMask);
+    mix(p.blendControl0);
+    mix(p.blendControl1);
+    mix(p.depthControl);
+    mix(p.rasterState);
+    mix(p.alphaTest);
+    mix(p.mode);
+    mix(p.primitiveRestart ? 1u : 0u);
+    mix(uint64_t(p.samples));
+    mix(uint64_t(p.depthFormat));
+    mix(p.layoutHash);
+    return h;
 }
 
 size_t PipelineCount()
@@ -9942,6 +9982,8 @@ bool DrawDebugOverlay(uint32_t imageIndex, VkImageLayout currentLayout)
     return true;
 }
 
+uint64_t AttributeLayoutHash(const ShaderModuleRec& vs);
+
 bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
                                   ShaderModuleRec& rec)
 {
@@ -9953,6 +9995,7 @@ bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
     rec.textureDimensions = std::move(metadata.textureDimensions);
     rec.aluConsts = std::move(metadata.aluConsts);
     rec.attributes = std::move(metadata.attributes);
+    rec.attributeLayoutHash = AttributeLayoutHash(rec);
     rec.aluDynamic = metadata.aluDynamic;
     rec.usesTextures = !rec.textureSlots.empty();
     rec.usesAlu = !rec.aluConsts.empty() || rec.aluDynamic;
@@ -9973,9 +10016,18 @@ bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
 
 ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
 {
-    for (auto& m : g_modules)
-        if (m.type == type && m.hash == hash)
-            return &m;
+    if (type < g_moduleIndex.size())
+    {
+        const auto found = g_moduleIndex[type].find(hash);
+        if (found != g_moduleIndex[type].end())
+            return found->second;
+    }
+    else
+    {
+        for (auto& m : g_modules)
+            if (m.type == type && m.hash == hash)
+                return &m;
+    }
     const MojoTranslatedShader* translated = ShaderCache_Find(type, hash);
     if (!translated || translated->spirv.empty())
         return nullptr;
@@ -10005,6 +10057,8 @@ ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
                  static_cast<unsigned long long>(hash), rec.colorOutputMask);
     }
     g_modules.push_back(std::move(rec));
+    if (type < g_moduleIndex.size())
+        g_moduleIndex[type][hash] = &g_modules.back();
     return &g_modules.back();
 }
 
@@ -10207,15 +10261,23 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
     const VkPrimitiveTopology topology = PrimitiveTopology(prim);
     if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM)
         return VK_NULL_HANDLE;
-    const uint64_t layoutHash = AttributeLayoutHash(vs);
+    const uint64_t layoutHash = vs.attributeLayoutHash;
     PipelineRec requested{vs.hash, pipelinePsHash, prim, colorMask, blendControl0,
                           blendControl1, depthControl, rasterState, effectiveAlphaTest,
                           mode, primitiveRestart, samples, depthFormat, layoutHash,
                           VK_NULL_HANDLE};
+    const uint64_t requestedKey = PipelineKeyHash(requested);
     auto findExisting = [&]() -> VkPipeline {
-        const auto existing = std::find_if(g_pipelines.begin(), g_pipelines.end(),
-            [&](const PipelineRec& p) { return SamePipelineKey(p, requested); });
-        return existing != g_pipelines.end() ? existing->pipeline : VK_NULL_HANDLE;
+        const auto range = g_pipelineIndex.equal_range(requestedKey);
+        for (auto it = range.first; it != range.second; ++it)
+            if (it->second < g_pipelines.size() &&
+                SamePipelineKey(g_pipelines[it->second], requested))
+                return g_pipelines[it->second].pipeline;
+        return VK_NULL_HANDLE;
+    };
+    auto remember = [&]() {
+        g_pipelines.push_back(requested);
+        g_pipelineIndex.emplace(requestedKey, g_pipelines.size() - 1u);
     };
     if (g_pipelinePrewarmActive.load(std::memory_order_acquire))
     {
@@ -10415,7 +10477,7 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
                 p_vkDestroyPipeline(g_device, pipeline, nullptr);
             return existing;
         }
-        g_pipelines.push_back(requested);
+        remember();
     }
     else
     {
@@ -10425,7 +10487,7 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
                 p_vkDestroyPipeline(g_device, pipeline, nullptr);
             return existing;
         }
-        g_pipelines.push_back(requested);
+        remember();
     }
     RecordPipelineManifest(requested);
     KLOG_DIAG("Vulkan pipeline created VS=%016llX PS=%016llX prim=%u attrs=%zu mask=%X "
@@ -14171,6 +14233,7 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         return false;
     if (g_outputSuspended)
         return true;
+    PollDrawTraceHotkey(g_frames.load(std::memory_order_relaxed) + 1);
     const auto presentStart = PerfClock::now();
     const bool ok = EndFrameAndPresent(frontBuffer, width, height);
     const auto presentEnd = PerfClock::now();
@@ -14873,7 +14936,10 @@ void VkPresenter_Shutdown()
     g_readbackAttempts = 0;
     g_frontReadbackFrame = 0;
     g_modules.clear();
+    for (auto& index : g_moduleIndex)
+        index.clear();
     g_pipelines.clear();
+    g_pipelineIndex.clear();
     g_snapshots.clear();
     g_colorBackings.clear();
     g_depthBackings.clear();

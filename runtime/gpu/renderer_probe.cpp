@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <vector>
 
+#include "../host/pipeline_metrics.h"
 #include "../host/window.h"
 #include "../config/runtime_config.h"
 #include "../kernel/klog.h"
@@ -37,6 +39,9 @@ std::vector<uint32_t> g_resolveDestinations;
 uint64_t g_windowResizeGeneration = 0;
 std::unique_ptr<mojorecomp::gpu::OrderedGpuCommandStream> g_gpuCommandStream;
 bool g_asyncExecutorEnabled = false;
+mojorecomp::host::PipelineCounters g_previousPipelineCounters{};
+bool g_havePreviousPipelineCounters = false;
+constexpr uint64_t kPipelineSummaryFrames = 120;
 
 bool EnvEnabled(const char* name)
 {
@@ -222,6 +227,37 @@ void OnDraw(uint8_t* base, const Pm4Draw& draw)
     }
 }
 
+// One line per 120 guest swaps naming the busiest pipeline stage. Sampling is
+// a handful of atomic loads and one GetThreadTimes call per window.
+void LogPipelineSummary(uint64_t swaps)
+{
+    mojorecomp::host::PipelineCounters current{};
+    current.wallNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    current.frames = swaps;
+    current.guestMainCpuNs = mojorecomp::host::GuestMainThreadCpuNs();
+    current.pm4ExecuteNs = Pm4_ExecuteCpuNs();
+    current.pm4DrawSinkNs = Pm4_ExecuteDrawSinkCpuNs();
+    if (g_gpuCommandStream)
+    {
+        const auto stats = g_gpuCommandStream->Stats();
+        current.executorActiveNs = stats.workerActiveNs;
+        current.executorBackpressureNs = stats.backpressureNs;
+    }
+    current.snapshotCacheHits = mojorecomp::gpu::GuestSnapshotCacheHitCount();
+    current.snapshotCacheMisses = mojorecomp::gpu::GuestSnapshotCacheMissCount();
+    current.snapshotCopiedBytes = mojorecomp::gpu::GuestSnapshotCopiedBytes();
+    current.snapshotWriteFaults = mojorecomp::gpu::GuestSnapshotWriteFaultCount();
+    current.snapshotProtectCalls = mojorecomp::gpu::GuestSnapshotProtectCallCount();
+    current.snapshotVolatileCaptures = mojorecomp::gpu::GuestSnapshotVolatileCaptureCount();
+    mojorecomp::host::ReadPipelineCounters(current);
+    if (g_havePreviousPipelineCounters)
+        KLOG("%s\n", mojorecomp::host::FormatPipelineSummary(
+                          g_previousPipelineCounters, current).c_str());
+    g_previousPipelineCounters = current;
+    g_havePreviousPipelineCounters = true;
+}
+
 void OnSwap(uint8_t*, uint32_t frontBuffer, uint32_t width, uint32_t height)
 {
     HostWindow_Pump();
@@ -256,8 +292,11 @@ void OnSwap(uint8_t*, uint32_t frontBuffer, uint32_t width, uint32_t height)
     }
 
     const uint64_t number = ++g_swaps;
+    mojorecomp::gpu::GuestSnapshotAdvanceEpoch();
     g_publishedDraws.store(g_draws, std::memory_order_relaxed);
     g_publishedSwaps.store(g_swaps, std::memory_order_relaxed);
+    if (number == 1 || (number % kPipelineSummaryFrames) == 0)
+        LogPipelineSummary(number);
     if (number == 1)
         KLOG("gpu-probe first stream swap: front=%08X %ux%u\n",
              frontBuffer, width, height);

@@ -16,6 +16,7 @@
 #include "cpu/guest_fiber.h"
 #include "gpu/pm4.h"
 #include "host/frame_rate_policy.h"
+#include "host/pipeline_metrics.h"
 #include "kernel/guestcall.h"
 
 namespace {
@@ -129,8 +130,13 @@ void MojoRecompGuestMemcpy(PPCRegister& dst, PPCRegister& src, PPCRegister& size
 
 void MojoRecompHfrFrameGate(PPCRegister& elapsedUs) {
     static thread_local mojorecomp::host::TitleFrameGatePhase gatePhase;
+    const uint32_t measuredUs = elapsedUs.u32;
     elapsedUs.u32 = mojorecomp::host::TitleFrameGateElapsedUsPhased(
-        elapsedUs.u32, ActiveTitleFrameRatePolicy(), gatePhase);
+        measuredUs, ActiveTitleFrameRatePolicy(), gatePhase);
+    // The guest dispatches its update when r28 exceeds the threshold, so the
+    // measured value at that point is the title's frame-to-frame interval.
+    if (elapsedUs.u32 > mojorecomp::host::kTitleFrameGateThresholdUs)
+        mojorecomp::host::NoteTitleFrameGateRelease(measuredUs);
 }
 
 void MojoRecompHfrProgressCadence(PPCRegister& lookaheadCounter) {
@@ -217,6 +223,36 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
     const uint32_t yieldInterval = GpuPollYieldInterval();
     const uint32_t delayUs = GpuPollDelayUs();
     const bool waitingOnCp = !(statusFlags & 0x2u) && currentPtrSlot && currentPtr == observedPtr;
+
+    // Account the wall time this thread spends waiting for the PM4 thread to
+    // advance the CP read pointer. Clock reads happen only while waiting.
+    struct CpWaitEpisode {
+        bool active = false;
+        uint32_t object = 0;
+        uint32_t observed = 0;
+        std::chrono::steady_clock::time_point start{};
+        std::chrono::steady_clock::time_point last{};
+    };
+    static thread_local CpWaitEpisode cpWait;
+    if (waitingOnCp || cpWait.active) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool sameEpisode = cpWait.active && cpWait.object == object &&
+                                 cpWait.observed == observedPtr;
+        if (cpWait.active && (!waitingOnCp || !sameEpisode)) {
+            // The poll loop normally calls this hook once more after the
+            // pointer moves. If it left another way, end at the last poll.
+            const bool endsNow = !waitingOnCp &&
+                                 now - cpWait.last < std::chrono::milliseconds(1);
+            const auto end = endsNow ? now : cpWait.last;
+            mojorecomp::host::NoteGuestCpWait(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end - cpWait.start).count()));
+            cpWait.active = false;
+        }
+        if (waitingOnCp && !cpWait.active)
+            cpWait = {true, object, observedPtr, now, now};
+        else if (waitingOnCp)
+            cpWait.last = now;
+    }
     const auto framePolicy = ActiveTitleFrameRatePolicy();
     const bool hfrCooperativePoll =
         framePolicy.mode == mojorecomp::host::FrameRateMode::HighFrameRate60 &&

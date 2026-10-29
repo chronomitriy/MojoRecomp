@@ -24,6 +24,7 @@
 #include "../kernel/unimplemented.h"
 #include "../kernel/xex_loader.h"
 #include "../host/frame_rate_policy.h"
+#include "../host/pipeline_metrics.h"
 #include "../host/timing.h"
 #include "pm4.h"
 #include "renderer_probe.h"
@@ -272,6 +273,7 @@ void GraphicsVblankPump()
                 // MarkVblank before dispatching source 0. EVENT_WRITE_SHD can
                 // expose this counter directly to guest memory.
                 Pm4_IncrementCounter();
+                mojorecomp::host::NoteGuestVblank();
                 DeliverGraphicsInterrupt(threadContext, 0);
                 perfVblankIsrNs += static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(

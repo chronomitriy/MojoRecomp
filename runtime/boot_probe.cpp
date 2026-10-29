@@ -31,6 +31,7 @@
 #include "gpu/vk_presenter.h"
 #include "host/crash_reporter.h"
 #include "host/frame_rate_policy.h"
+#include "host/pipeline_metrics.h"
 #include "host/window.h"
 #include "kernel/heap.h"
 #include "kernel/guestcall.h"
@@ -1003,6 +1004,7 @@ int main(int argc, char** argv) {
         const DWORD mainGuestTid = GetCurrentThreadId();
         std::fprintf(stderr, "[cpu] main guest host tid=%lu\n",
                      static_cast<unsigned long>(mainGuestTid));
+        mojorecomp::host::SetGuestMainThread(static_cast<uint32_t>(mainGuestTid));
         StartGuestThreadTimeProfile(mainGuestTid);
 #endif
         try {

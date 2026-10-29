@@ -118,6 +118,11 @@ if(BUILD_TESTING)
     add_executable(MojoRecompFrameRatePolicyTest tests/frame_rate_policy_test.cpp)
     add_test(NAME FrameRatePolicy COMMAND MojoRecompFrameRatePolicyTest)
     set_tests_properties(FrameRatePolicy PROPERTIES TIMEOUT 10 LABELS "host;timing")
+    add_executable(MojoRecompPipelineMetricsTest
+        tests/pipeline_metrics_test.cpp
+        host/pipeline_metrics.cpp)
+    add_test(NAME PipelineMetrics COMMAND MojoRecompPipelineMetricsTest)
+    set_tests_properties(PipelineMetrics PROPERTIES TIMEOUT 10 LABELS "host;performance")
     add_executable(MojoRecompPpcConstantScanTest
         tests/ppc_constant_scan_test.cpp
         cpu/ppc_constant_scan.cpp)
@@ -156,7 +161,8 @@ if(BUILD_TESTING)
     add_test(NAME DebugOverlay COMMAND MojoRecompDebugOverlayTest)
     add_executable(MojoRecompInputMergeTest tests/input_merge_test.cpp)
     add_test(NAME InputMerge COMMAND MojoRecompInputMergeTest)
-    add_executable(MojoRecompPm4ExtentProbe tests/pm4_extent_probe.cpp gpu/pm4.cpp)
+    add_executable(MojoRecompPm4ExtentProbe tests/pm4_extent_probe.cpp gpu/pm4.cpp
+        host/pipeline_metrics.cpp)
     add_test(NAME Pm4ExtentProbe COMMAND MojoRecompPm4ExtentProbe)
     set_tests_properties(Pm4ExtentProbe PROPERTIES TIMEOUT 10 LABELS "gpu")
     add_executable(MojoRecompVfsProbe tests/vfs_probe.cpp kernel/vfs.cpp kernel/klog.cpp)
@@ -177,6 +183,10 @@ if(BUILD_TESTING)
         subtitles/dialogue_catalog.cpp)
     add_test(NAME DialogueCatalog COMMAND MojoRecompDialogueCatalogTest)
     set_tests_properties(DialogueCatalog PROPERTIES TIMEOUT 10 LABELS "subtitles")
+    # Manual microbenchmark, built on request only:
+    #   cmake --build <dir> --target MojoRecompDrawLookupBenchmark
+    add_executable(MojoRecompDrawLookupBenchmark EXCLUDE_FROM_ALL
+        tests/draw_lookup_benchmark.cpp)
     add_executable(MojoRecompRcfDiagnosticsTest
         tests/rcf_diagnostics_test.cpp
         kernel/rcf_diagnostics.cpp)
@@ -409,6 +419,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     gpu/vk_presenter.cpp
     gpu/vd.cpp
     host/input.cpp
+    host/pipeline_metrics.cpp
     host/presentation_metrics.cpp
     host/stutter_profiler.cpp
     host/timing.cpp
@@ -427,6 +438,19 @@ set(MOJORECOMP_KERNEL_SOURCES
     title_hooks.cpp)
 
 if(BUILD_TESTING AND WIN32)
+    add_executable(MojoRecompGuestMemorySnapshotHotPagesTest
+        tests/guest_memory_snapshot_hot_pages_test.cpp
+        gpu/guest_memory_snapshot.cpp)
+    target_link_libraries(MojoRecompGuestMemorySnapshotHotPagesTest PRIVATE onecore)
+    add_test(NAME GuestMemorySnapshotHotPages COMMAND MojoRecompGuestMemorySnapshotHotPagesTest)
+    set_tests_properties(GuestMemorySnapshotHotPages PROPERTIES TIMEOUT 10
+        LABELS "gpu;memory;performance")
+    # Manual microbenchmark of the write-protection cost, built on request only.
+    add_executable(MojoRecompSnapshotFaultBenchmark EXCLUDE_FROM_ALL
+        tests/snapshot_fault_benchmark.cpp
+        gpu/guest_memory_snapshot.cpp)
+    target_link_libraries(MojoRecompSnapshotFaultBenchmark PRIVATE onecore)
+
     add_executable(MojoRecompWindowModeTest
         tests/window_mode_test.cpp
         host/window.cpp)
@@ -485,6 +509,7 @@ if(BUILD_TESTING AND WIN32)
         gpu/guest_memory_snapshot.cpp
         gpu/pm4.cpp
         kernel/klog.cpp
+        host/pipeline_metrics.cpp
         host/presentation_metrics.cpp
         host/stutter_profiler.cpp
         host/window.cpp

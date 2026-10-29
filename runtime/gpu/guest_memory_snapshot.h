@@ -70,6 +70,15 @@ bool GuestSnapshotReadFailed() noexcept;
 uint64_t GuestSnapshotCacheHitCount() noexcept;
 uint64_t GuestSnapshotCacheMissCount() noexcept;
 uint64_t GuestSnapshotMissingReadCount() noexcept;
+// Guest writes that hit a write-protected tracked page, VirtualProtect calls
+// that re-protect tracked pages, and bytes copied into snapshots.
+uint64_t GuestSnapshotWriteFaultCount() noexcept;
+uint64_t GuestSnapshotProtectCallCount() noexcept;
+uint64_t GuestSnapshotCopiedBytes() noexcept;
+// Captures served by a fresh copy because they touch a hot writable page
+// (opt-in MOJORECOMP_SNAPSHOT_HOT_PAGES=1). The epoch advances once per swap.
+uint64_t GuestSnapshotVolatileCaptureCount() noexcept;
+void GuestSnapshotAdvanceEpoch() noexcept;
 void GuestSnapshotCacheShutdown();
 
 } // namespace mojorecomp::gpu

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <limits>
@@ -70,6 +71,28 @@ std::atomic<uint64_t> g_cacheHits{0};
 std::atomic<uint64_t> g_cacheMisses{0};
 std::atomic<uint64_t> g_missingReads{0};
 std::atomic<uint64_t> g_nextIdentity{1};
+// Cost accounting for the write-protection scheme: every guest write to a
+// tracked page takes an access-violation round trip on the writing thread, and
+// every re-protection is a VirtualProtect (TLB shootdown) on the PM4 thread.
+std::atomic<uint64_t> g_writeFaults{0};
+std::atomic<uint64_t> g_protectCalls{0};
+std::atomic<uint64_t> g_copiedBytes{0};
+
+// Opt-in adaptive tracking, MOJORECOMP_SNAPSHOT_HOT_PAGES=1. A page that takes
+// a second write fault within kHotFaultWindowEpochs swaps of the previous one
+// is rewritten every frame or so (dynamic vertices, command memory). Keeping it
+// protected costs a fault on the guest thread plus a VirtualProtect on the PM4
+// thread per rewrite. Such a page stays writable for kHotHoldEpochs swaps and
+// small ranges touching it are copied fresh instead of cached; large ranges
+// (textures) keep the normal protected cache, which re-tracks the page.
+constexpr uint32_t kHotFaultWindowEpochs = 8;
+constexpr uint32_t kHotHoldEpochs = 240;
+constexpr uint64_t kVolatileRangeLimitBytes = 256u * 1024u;
+std::atomic<bool> g_hotPagePolicy{false};
+std::atomic<uint32_t> g_snapshotEpoch{1};
+std::array<std::atomic<uint32_t>, kPageCount> g_pageLastFaultEpoch{};
+std::array<std::atomic<uint32_t>, kPageCount> g_pageHotUntilEpoch{};
+std::atomic<uint64_t> g_volatileCaptures{0};
 
 #if defined(_WIN32)
 PVOID g_vectoredHandler = nullptr;
@@ -144,6 +167,15 @@ LONG CALLBACK SnapshotWriteFaultHandler(EXCEPTION_POINTERS* exceptionInfo)
 
     g_pageState[page].store(3, std::memory_order_release);
     g_pageGeneration[page].fetch_add(1, std::memory_order_acq_rel);
+    g_writeFaults.fetch_add(1, std::memory_order_relaxed);
+    if (g_hotPagePolicy.load(std::memory_order_relaxed))
+    {
+        const uint32_t epoch = g_snapshotEpoch.load(std::memory_order_relaxed);
+        const uint32_t previous =
+            g_pageLastFaultEpoch[page].exchange(epoch, std::memory_order_relaxed);
+        if (previous && epoch - previous <= kHotFaultWindowEpochs)
+            g_pageHotUntilEpoch[page].store(epoch + kHotHoldEpochs, std::memory_order_relaxed);
+    }
     if (!SetAliasPageProtection(base, page, page, PAGE_READWRITE))
         return EXCEPTION_CONTINUE_SEARCH;
     g_pageState[page].store(0, std::memory_order_release);
@@ -162,6 +194,8 @@ bool EnsureTrackingBase(const uint8_t* guestBase)
         return false;
     if (!g_vectoredHandler)
     {
+        const char* hotPages = std::getenv("MOJORECOMP_SNAPSHOT_HOT_PAGES");
+        g_hotPagePolicy.store(hotPages && hotPages[0] == '1', std::memory_order_relaxed);
         g_vectoredHandler = AddVectoredExceptionHandler(1, SnapshotWriteFaultHandler);
         if (!g_vectoredHandler)
             return false;
@@ -206,6 +240,7 @@ bool ProtectTrackedPages(const uint8_t* guestBase, size_t firstPage, size_t last
             g_pageTouched[runEnd].store(1, std::memory_order_release);
         }
 
+        g_protectCalls.fetch_add(1, std::memory_order_relaxed);
         if (!SetAliasPageProtection(base, runBegin, runEnd, PAGE_READONLY))
         {
             SetAliasPageProtection(base, runBegin, runEnd, PAGE_READWRITE);
@@ -229,6 +264,19 @@ bool ProtectTrackedPages(const uint8_t* guestBase, size_t firstPage, size_t last
     return true;
 }
 #endif
+
+// True when the range touches a hot page that is currently writable.
+bool RangeHasHotWritablePage(size_t firstPage, size_t lastPage)
+{
+    const uint32_t epoch = g_snapshotEpoch.load(std::memory_order_relaxed);
+    for (size_t page = firstPage; page <= lastPage; ++page)
+    {
+        if (g_pageHotUntilEpoch[page].load(std::memory_order_relaxed) > epoch &&
+            g_pageState[page].load(std::memory_order_acquire) != 1)
+            return true;
+    }
+    return false;
+}
 
 std::vector<uint64_t> ReadGenerations(size_t firstPage, size_t lastPage)
 {
@@ -315,6 +363,22 @@ bool GuestMemorySnapshot::Capture(const uint8_t* guestBase, uint32_t address, ui
                 break;
             }
 
+            // A hot page is rewritten so often that re-protecting it costs more
+            // than copying a small range every time. Such a capture is never
+            // cached: the cache only serves ranges whose pages are all tracked.
+            if (g_hotPagePolicy.load(std::memory_order_relaxed) &&
+                bytes <= kVolatileRangeLimitBytes &&
+                RangeHasHotWritablePage(firstPage, lastPage))
+            {
+                auto data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(bytes));
+                std::memcpy(data->data(), guestBase + address, static_cast<size_t>(bytes));
+                g_copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                g_volatileCaptures.fetch_add(1, std::memory_order_relaxed);
+                captured = std::move(data);
+                identity = g_nextIdentity.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+
             // A stable cached generation implies every page is still tracked
             // read-only, so the common cache-hit path above needs no separate
             // protection scan. Only misses/dirty ranges need to transition
@@ -325,6 +389,7 @@ bool GuestMemorySnapshot::Capture(const uint8_t* guestBase, uint32_t address, ui
             std::vector<uint64_t> generations = ReadGenerations(firstPage, lastPage);
             auto data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(bytes));
             std::memcpy(data->data(), guestBase + address, static_cast<size_t>(bytes));
+            g_copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
             if (!GenerationsStable(generations, firstPage, lastPage))
                 continue;
 
@@ -355,6 +420,7 @@ bool GuestMemorySnapshot::Capture(const uint8_t* guestBase, uint32_t address, ui
 #else
         auto data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(bytes));
         std::memcpy(data->data(), guestBase + address, static_cast<size_t>(bytes));
+        g_copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
         captured = std::move(data);
         identity = g_nextIdentity.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -363,6 +429,7 @@ bool GuestMemorySnapshot::Capture(const uint8_t* guestBase, uint32_t address, ui
     {
         auto data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(bytes));
         std::memcpy(data->data(), guestBase + address, static_cast<size_t>(bytes));
+        g_copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
         captured = std::move(data);
         identity = g_nextIdentity.fetch_add(1, std::memory_order_relaxed);
     }
@@ -517,6 +584,31 @@ uint64_t GuestSnapshotMissingReadCount() noexcept
     return g_missingReads.load(std::memory_order_relaxed);
 }
 
+uint64_t GuestSnapshotWriteFaultCount() noexcept
+{
+    return g_writeFaults.load(std::memory_order_relaxed);
+}
+
+uint64_t GuestSnapshotProtectCallCount() noexcept
+{
+    return g_protectCalls.load(std::memory_order_relaxed);
+}
+
+uint64_t GuestSnapshotCopiedBytes() noexcept
+{
+    return g_copiedBytes.load(std::memory_order_relaxed);
+}
+
+uint64_t GuestSnapshotVolatileCaptureCount() noexcept
+{
+    return g_volatileCaptures.load(std::memory_order_relaxed);
+}
+
+void GuestSnapshotAdvanceEpoch() noexcept
+{
+    g_snapshotEpoch.fetch_add(1, std::memory_order_relaxed);
+}
+
 void GuestSnapshotCacheShutdown()
 {
     std::lock_guard<std::mutex> lock(g_cacheMutex);
@@ -543,6 +635,8 @@ void GuestSnapshotCacheShutdown()
                 g_pageState[i].store(0, std::memory_order_relaxed);
                 g_pageTouched[i].store(0, std::memory_order_relaxed);
                 g_pageGeneration[i].store(0, std::memory_order_relaxed);
+                g_pageLastFaultEpoch[i].store(0, std::memory_order_relaxed);
+                g_pageHotUntilEpoch[i].store(0, std::memory_order_relaxed);
             }
             ++page;
         }
