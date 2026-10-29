@@ -435,7 +435,8 @@ set(MOJORECOMP_KERNEL_SOURCES
     cpu/guest_fiber.cpp
     runtime_state.cpp
     title_resources.cpp
-    title_hooks.cpp)
+    title_hooks.cpp
+    title_hfr_discovery.cpp)
 
 if(BUILD_TESTING AND WIN32)
     add_executable(MojoRecompGuestMemorySnapshotHotPagesTest

@@ -784,6 +784,12 @@ int main(int argc, char** argv) {
                  frameRatePolicy.simulationHz, frameRatePolicy.presentationHz,
                  frameRatePolicy.displayHz, frameRatePolicy.guestVblankHz,
                  frameRatePolicy.requiresTitlePatches ? 1u : 0u);
+    if (frameRatePolicy.mode == mojorecomp::host::FrameRateMode::HighFrameRateUnlocked)
+        std::fprintf(stderr,
+                     "cot-runtime: unlocked frame rate requested=%uHz%s; the title runs the "
+                     "60 FPS policy until its 1/60 s scheduler floor is lifted\n",
+                     frameRatePolicy.presentationHz,
+                     frameRatePolicy.uncapped ? " (uncapped ceiling)" : "");
     mojorecomp::debug::SetEnabled(false);
     if (options.configPath)
     {

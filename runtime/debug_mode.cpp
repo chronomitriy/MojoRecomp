@@ -375,11 +375,11 @@ void PollHotkeys()
         }
         if (Pressed(VK_F7) && g_paused.load(std::memory_order_relaxed))
         {
-            mojorecomp::timebase::AdvanceDebugFrame(
-                mojorecomp::host::ActiveFrameRatePolicy().simulationHz);
+            const uint32_t stepHz =
+                mojorecomp::host::EffectiveActiveFrameRatePolicy().simulationHz;
+            mojorecomp::timebase::AdvanceDebugFrame(stepHz);
             SetNotification(Notification::FrameAdvanced, 1200);
-            std::fprintf(stderr, "[debug] frame-step 1/%us\n",
-                         mojorecomp::host::ActiveFrameRatePolicy().simulationHz);
+            std::fprintf(stderr, "[debug] frame-step 1/%us\n", stepHz);
         }
         (void)Pressed(VK_F10); // Reserved for a verified restart-level hook.
     }

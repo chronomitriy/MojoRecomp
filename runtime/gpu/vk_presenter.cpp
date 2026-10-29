@@ -14245,7 +14245,9 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
     if (ok)
     {
         ObserveStutterFrame(frame, presentEnd, presentNs);
-        const auto policy = mojorecomp::host::ActiveFrameRatePolicy();
+        // Effective policy: an unlocked request paces at 60 Hz until the
+        // title's scheduler floor is lifted. Identical to the active policy at 30/60.
+        const auto policy = mojorecomp::host::EffectiveActiveFrameRatePolicy();
         const auto targetPeriod = std::chrono::duration_cast<std::chrono::nanoseconds>(
             mojorecomp::host::PeriodForHzRoundedUs(policy.presentationHz));
         if (const auto cadence = g_framePacingProfiler.Observe(presentEnd, targetPeriod))

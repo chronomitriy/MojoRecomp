@@ -3,6 +3,7 @@
 
 #include "ppc_recomp_shared.h"
 
+#include <atomic>
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include "host/frame_rate_policy.h"
 #include "host/pipeline_metrics.h"
 #include "kernel/guestcall.h"
+#include "title_hfr_discovery.h"
 
 namespace {
 
@@ -28,10 +30,36 @@ struct DecoderFillState {
 
 thread_local DecoderFillState g_decoderFillState;
 
+// Guest addresses of the HFR hook sites in config/CrashOfTheTitans.toml, used
+// only to label MOJORECOMP_HFR_DISCOVERY output.
+constexpr uint32_t kHfrFrameGateSite = 0x821FD15Cu;
+constexpr uint32_t kHfrProgressWaitSite = 0x8238F02Cu;
+constexpr uint32_t kHfrProgressCadenceSite = 0x8238F05Cu;
+
 mojorecomp::host::FrameRatePolicy ActiveTitleFrameRatePolicy()
 {
+    // An unlocked request is the 60 FPS policy until the scheduler floor hook
+    // has lowered the title's 1/60 s minimum step. 30/60 pass through unchanged.
     return mojorecomp::host::TitlePolicyForNativeCadenceContent(
-        mojorecomp::host::ActiveFrameRatePolicy(), Pm4_BinkVideoCadenceActive());
+        mojorecomp::host::EffectiveActiveFrameRatePolicy(), Pm4_BinkVideoCadenceActive());
+}
+
+// One-time notice when an unlocked rate is requested but this build has no
+// scheduler-floor hook, so the title necessarily stays at 60 Hz.
+void NoteUnlockedRateHeldAt60()
+{
+    const auto requested = mojorecomp::host::ActiveFrameRatePolicy();
+    if (requested.mode != mojorecomp::host::FrameRateMode::HighFrameRateUnlocked ||
+        mojorecomp::host::TitleSchedulerFloorLifted().load(std::memory_order_acquire))
+        return;
+    static thread_local uint32_t releases = 0;
+    if (++releases != 900u) // ~15 s at 60 Hz
+        return;
+    std::fprintf(stderr,
+        "[hfr] unlocked rate %u Hz%s requested, but MojoRecompHfrSchedulerFloor has not run: "
+        "the title stays at 60 Hz. Locate the floor with MOJORECOMP_HFR_DISCOVERY=1 "
+        "(docs/HFR-UNLIMITED.md).\n",
+        requested.presentationHz, requested.uncapped ? " (uncapped)" : "");
 }
 
 bool NativeFibersEnabled() {
@@ -136,15 +164,50 @@ void MojoRecompHfrFrameGate(PPCRegister& elapsedUs) {
     // The guest dispatches its update when r28 exceeds the threshold, so the
     // measured value at that point is the title's frame-to-frame interval.
     if (elapsedUs.u32 > mojorecomp::host::kTitleFrameGateThresholdUs)
+    {
         mojorecomp::host::NoteTitleFrameGateRelease(measuredUs);
+        NoteUnlockedRateHeldAt60();
+    }
+    if (MojoRecompHfrDiscoveryEnabled())
+        MojoRecompHfrDiscoveryObserve("frame-gate", kHfrFrameGateSite);
+}
+
+// Lowers the title's 1/60 s scheduler floor for the unlocked frame rates. The
+// address is title-specific and has to be located on a machine with the game
+// (MOJORECOMP_HFR_DISCOVERY=1); the hook is installed by adding the printed
+// [[midasm_hook]] block, after the instruction that loads the floor, to
+// config/CrashOfTheTitans.toml. 30/60 FPS never touch the register, and only a
+// register that really holds 1/60 s is rewritten or unlocks the outer gate.
+void MojoRecompHfrSchedulerFloor(PPCRegister& floor) {
+    const auto requested = mojorecomp::host::ActiveFrameRatePolicy();
+    if (requested.mode != mojorecomp::host::FrameRateMode::HighFrameRateUnlocked)
+        return;
+    if (!mojorecomp::host::IsTitleSchedulerFloorValue(floor.f64)) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true))
+            std::fprintf(stderr,
+                "[hfr] MojoRecompHfrSchedulerFloor saw %.9g instead of 1/60 s; "
+                "the hook is not on the scheduler floor and stays inactive\n", floor.f64);
+        return;
+    }
+    floor.f64 = mojorecomp::host::TitleSchedulerFloorSeconds(floor.f64, requested);
+    if (!mojorecomp::host::TitleSchedulerFloorLifted().exchange(true, std::memory_order_acq_rel))
+        std::fprintf(stderr,
+            "[hfr] scheduler floor lifted: 16.667 ms -> %.3f ms; title gate now %u Hz%s\n",
+            floor.f64 * 1000.0, requested.presentationHz,
+            requested.uncapped ? " (uncapped ceiling)" : "");
 }
 
 void MojoRecompHfrProgressCadence(PPCRegister& lookaheadCounter) {
     lookaheadCounter.u32 = mojorecomp::host::TitleProgressCadenceCounter(
         lookaheadCounter.u32, ActiveTitleFrameRatePolicy());
+    if (MojoRecompHfrDiscoveryEnabled())
+        MojoRecompHfrDiscoveryObserve("progress-cadence", kHfrProgressCadenceSite);
 }
 
 bool MojoRecompHfrSkipProgressWait() {
+    if (MojoRecompHfrDiscoveryEnabled())
+        MojoRecompHfrDiscoveryObserve("progress-wait", kHfrProgressWaitSite);
     return mojorecomp::host::TitleProgressWaitBypass(
         ActiveTitleFrameRatePolicy());
 }
@@ -253,10 +316,8 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
         else if (waitingOnCp)
             cpWait.last = now;
     }
-    const auto framePolicy = ActiveTitleFrameRatePolicy();
     const bool hfrCooperativePoll =
-        framePolicy.mode == mojorecomp::host::FrameRateMode::HighFrameRate60 &&
-        framePolicy.requiresTitlePatches;
+        mojorecomp::host::TitleGpuPollCooperative(ActiveTitleFrameRatePolicy());
 
     // Xenon's db16cyc backoff becomes a no-op in the recompilation. In HFR,
     // restore that short CPU pause only while the CP pointer is unchanged. A
