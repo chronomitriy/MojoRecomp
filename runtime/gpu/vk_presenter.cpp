@@ -44,7 +44,9 @@
 #include "../host/system_font_atlas.h"
 #include "../subtitles/subtitle_runtime.h"
 #include "pm4.h"
+#include "frame_hash_map.h"
 #include "guest_memory_snapshot.h"
+#include "index_scan.h"
 #include "shader_cache.h"
 #include "shader_metadata.h"
 #include "shader_translator.h"
@@ -787,9 +789,10 @@ struct IndexUploadCacheValue
     uint64_t bytes = 0;
 };
 
-std::unordered_map<VertexUploadCacheKey, VkDeviceSize, VertexUploadCacheKeyHash>
+// Emptied at every BeginFrame; flat tables, so an upload never allocates.
+mojorecomp::gpu::FrameHashMap<VertexUploadCacheKey, VkDeviceSize, VertexUploadCacheKeyHash>
     g_frameVertexUploadCache;
-std::unordered_map<IndexUploadCacheKey, IndexUploadCacheValue, IndexUploadCacheKeyHash>
+mojorecomp::gpu::FrameHashMap<IndexUploadCacheKey, IndexUploadCacheValue, IndexUploadCacheKeyHash>
     g_frameIndexUploadCache;
 
 bool FrontDiagnosticFrame(uint64_t frame)
@@ -10802,8 +10805,8 @@ bool BeginFrame()
     g_uploadAt = uploadBase;
     g_uploadLimit = std::min(uploadBase + kFrameUploadBytes,
                              g_readbackOffset ? g_readbackOffset : kUploadBytes);
-    g_frameVertexUploadCache.clear();
-    g_frameIndexUploadCache.clear();
+    g_frameVertexUploadCache.Clear();
+    g_frameIndexUploadCache.Clear();
     if (g_uploadLimit <= uploadBase)
         return false;
 
@@ -11562,12 +11565,28 @@ struct PreparedDraw
     int32_t baseVertex = 0;
 };
 
+// Phase 3 (docs/HFR-PHASE3.md section 7): decode and scan guest indices with
+// SSE2 instead of one ReadIndexValue call per index and pass.
+// MOJORECOMP_VERTEX_FAST_PATH=0 restores the per-index loops for A/B timing;
+// both give the same values (tests/vertex_path_test.cpp).
+bool VertexFastPathEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_VERTEX_FAST_PATH");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
 bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                            const ShaderModuleRec& vs, PreparedDraw& out)
 {
-    std::array<VkBuffer, 128> buffers{};
-    std::array<VkDeviceSize, 128> offsets{};
+    // Only the first bindingCount entries are passed to Vulkan, so neither
+    // array needs clearing for every draw.
+    std::array<VkBuffer, 128> buffers;
+    std::array<VkDeviceSize, 128> offsets;
     uint32_t bindingCount = 0;
+    const bool fastPath = VertexFastPathEnabled();
     const uint32_t indexOffset = regs[xenos::kVgtIndxOffset] & xenos::kVertexIndexMask;
     const uint32_t minVertex = regs[xenos::kVgtMinVtxIndx] & xenos::kVertexIndexMask;
     const uint32_t maxVertexClamp = regs[xenos::kVgtMaxVtxIndx] & xenos::kVertexIndexMask;
@@ -11597,16 +11616,30 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             base, draw.indexVa, static_cast<size_t>(indexReadBytes));
         maxIndex = 0;
         maxEffectiveIndex = 0;
-        for (uint32_t i = 0; i < draw.indexCount; ++i)
+        mojorecomp::gpu::GuestIndexBounds bounds{};
+        if (fastPath &&
+            mojorecomp::gpu::FastGuestIndexBounds(indexSrc, draw.indexCount, draw.index32,
+                                                  draw.indexEndian, primitiveRestart,
+                                                  guestRestartIndex, indexOffset, minVertex,
+                                                  maxVertexClamp, bounds))
         {
-            const uint32_t raw = ReadIndexValue(indexSrc, i, draw.index32, draw.indexEndian);
-            if (primitiveRestart && raw == guestRestartIndex)
-                continue;
-            const uint32_t effective = xenos::RemapVertexIndex(raw, indexOffset,
-                                                               minVertex, maxVertexClamp);
-            maxIndex = std::max(maxIndex, raw);
-            maxEffectiveIndex = std::max(maxEffectiveIndex, effective);
-            remapIndices |= effective != raw;
+            maxIndex = bounds.maxRaw;
+            maxEffectiveIndex = bounds.maxEffective;
+            remapIndices = bounds.remap;
+        }
+        else
+        {
+            for (uint32_t i = 0; i < draw.indexCount; ++i)
+            {
+                const uint32_t raw = ReadIndexValue(indexSrc, i, draw.index32, draw.indexEndian);
+                if (primitiveRestart && raw == guestRestartIndex)
+                    continue;
+                const uint32_t effective = xenos::RemapVertexIndex(raw, indexOffset,
+                                                                   minVertex, maxVertexClamp);
+                maxIndex = std::max(maxIndex, raw);
+                maxEffectiveIndex = std::max(maxEffectiveIndex, effective);
+                remapIndices |= effective != raw;
+            }
         }
         if (rectangle)
             for (uint32_t i = 0; i < 3; ++i)
@@ -11710,9 +11743,13 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         }
     }
 
+    // Uploads made for this draw, per fetch slot, so attributes that share a
+    // slot share one copy. An entry belongs to this draw only when it carries
+    // this draw's stamp, which spares clearing 96 entries on every draw. Only
+    // the Vulkan thread prepares draws.
     struct UploadedVertexFetch
     {
-        bool valid = false;
+        uint64_t drawStamp = 0;
         uint32_t address = 0;
         uint32_t sizeDwords = 0;
         uint32_t endian = 0;
@@ -11720,7 +11757,9 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         uint64_t sourceDwords = 0;
         VkDeviceSize uploadAt = VK_WHOLE_SIZE;
     };
-    std::array<UploadedVertexFetch, 96> uploadedVertexFetches{};
+    static std::array<UploadedVertexFetch, 96> uploadedVertexFetches{};
+    static uint64_t uploadDrawStamp = 0;
+    const uint64_t drawStamp = ++uploadDrawStamp;
 
     for (const auto& a : vs.attributes)
     {
@@ -11924,7 +11963,7 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
 
         auto& cached = uploadedVertexFetches[a.fetchSlot];
         VkDeviceSize at = VK_WHOLE_SIZE;
-        if (cached.valid && cached.address == vf.address &&
+        if (cached.drawStamp == drawStamp && cached.address == vf.address &&
             cached.sizeDwords == vf.sizeDwords && cached.endian == vf.endian &&
             cached.strideDwords == a.strideDwords &&
             cached.sourceDwords == sourceDwords)
@@ -11944,10 +11983,9 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             if (immutable)
             {
                 frameKey = {identity.token, identity.offset, uploadBytes, vf.endian};
-                if (const auto found = g_frameVertexUploadCache.find(frameKey);
-                    found != g_frameVertexUploadCache.end())
+                if (const VkDeviceSize* found = g_frameVertexUploadCache.Find(frameKey))
                 {
-                    at = found->second;
+                    at = *found;
                     g_perfVertexReuseBytes += uploadBytes;
                     ++g_perfVertexReuseHits;
                 }
@@ -11965,9 +12003,9 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                 uint8_t* dst = g_uploadMapped + at;
                 CopySwapped(dst, src, size_t(uploadBytes), vf.endian);
                 if (immutable)
-                    g_frameVertexUploadCache.emplace(frameKey, at);
+                    g_frameVertexUploadCache.Emplace(frameKey, at);
             }
-            cached = {true, vf.address, vf.sizeDwords, vf.endian,
+            cached = {drawStamp, vf.address, vf.sizeDwords, vf.endian,
                       a.strideDwords, sourceDwords, at};
         }
         if (bindingCount >= buffers.size())
@@ -12000,12 +12038,11 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                 frameKey = {identity.token, identity.offset, indexReadBytes, out.count,
                             indexOffset, minVertex, maxVertexClamp, guestRestartIndex,
                             draw.indexEndian, draw.index32, primitiveRestart, rewritten};
-                if (const auto found = g_frameIndexUploadCache.find(frameKey);
-                    found != g_frameIndexUploadCache.end())
+                if (const IndexUploadCacheValue* found = g_frameIndexUploadCache.Find(frameKey))
                 {
-                    at = found->second.at;
-                    out.indexType = found->second.type;
-                    g_perfIndexReuseBytes += found->second.bytes;
+                    at = found->at;
+                    out.indexType = found->type;
+                    g_perfIndexReuseBytes += found->bytes;
                     ++g_perfIndexReuseHits;
                 }
             }
@@ -12019,7 +12056,23 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             g_perfIndexUploadBytes += indexUploadBytes;
             ++g_perfIndexUploadCopies;
             uint8_t* dst = g_uploadMapped + at;
-            if (rewritten)
+            if (rewritten && fastPath && draw.indexed)
+            {
+                // Decode once into the upload, then remap in place.
+                mojorecomp::gpu::DecodeGuestIndices(dst, indexSrc, out.count, draw.index32,
+                                                    draw.indexEndian, true);
+                auto* values = reinterpret_cast<uint32_t*>(dst);
+                for (uint32_t i = 0; i < out.count; ++i)
+                {
+                    const uint32_t raw = values[i];
+                    values[i] = primitiveRestart && raw == guestRestartIndex
+                                    ? 0xFFFFFFFFu
+                                    : xenos::RemapVertexIndex(raw, indexOffset,
+                                                              minVertex, maxVertexClamp);
+                }
+                out.indexType = VK_INDEX_TYPE_UINT32;
+            }
+            else if (rewritten)
             {
                 for (uint32_t i = 0; i < out.count; ++i)
                 {
@@ -12037,25 +12090,33 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             }
             else if (draw.index32)
             {
-                for (uint32_t i = 0; i < draw.indexCount; ++i)
-                {
-                    const uint32_t value = ReadIndexValue(indexSrc, i, true, draw.indexEndian);
-                    std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
-                }
+                if (fastPath)
+                    mojorecomp::gpu::DecodeGuestIndices(dst, indexSrc, draw.indexCount, true,
+                                                        draw.indexEndian, true);
+                else
+                    for (uint32_t i = 0; i < draw.indexCount; ++i)
+                    {
+                        const uint32_t value = ReadIndexValue(indexSrc, i, true, draw.indexEndian);
+                        std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
+                    }
                 out.indexType = VK_INDEX_TYPE_UINT32;
             }
             else
             {
-                for (uint32_t i = 0; i < draw.indexCount; ++i)
-                {
-                    const uint16_t value = uint16_t(ReadIndexValue(indexSrc, i, false,
-                                                                   draw.indexEndian));
-                    std::memcpy(dst + uint64_t(i) * 2u, &value, sizeof(value));
-                }
+                if (fastPath)
+                    mojorecomp::gpu::DecodeGuestIndices(dst, indexSrc, draw.indexCount, false,
+                                                        draw.indexEndian, false);
+                else
+                    for (uint32_t i = 0; i < draw.indexCount; ++i)
+                    {
+                        const uint16_t value = uint16_t(ReadIndexValue(indexSrc, i, false,
+                                                                       draw.indexEndian));
+                        std::memcpy(dst + uint64_t(i) * 2u, &value, sizeof(value));
+                    }
                 out.indexType = VK_INDEX_TYPE_UINT16;
             }
             if (immutable)
-                g_frameIndexUploadCache.emplace(
+                g_frameIndexUploadCache.Emplace(
                     frameKey, IndexUploadCacheValue{at, out.indexType, indexUploadBytes});
         }
         out.indexAt = at;
