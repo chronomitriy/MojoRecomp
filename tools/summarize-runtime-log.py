@@ -32,6 +32,27 @@ HEALTH_RE = re.compile(r"Vulkan raster health: .*?pipelines=(?P<pipelines>\d+) m
 PIPELINE_RE = re.compile(r"\[pipeline\] frames=\d+ fps=(?P<fps>[\d.]+) frame=(?P<frame>[\d.]+)ms "
                          r"busiest=(?P<busiest>\w+)\((?P<share>\d+)%\)")
 POLICY_RE = re.compile(r"frame policy simulation=(?P<sim>\d+)Hz presentation=(?P<pres>\d+)Hz")
+# Per-frame fields of the [pipeline] line (docs/HFR-UNLIMITED.md section 2.7).
+PIPELINE_FIELDS = {
+    "guest cpu ms": re.compile(r"guest cpu=([\d.]+)ms"),
+    "cpWait ms": re.compile(r"cpWait=([\d.]+)ms"),
+    "pm4 busy ms": re.compile(r"pm4 busy=([\d.]+)ms"),
+    "pm4 sink ms": re.compile(r" sink=([\d.]+)ms"),
+    "backpressure ms": re.compile(r"backpressure=([\d.]+)ms"),
+    "pm4 stall ms": re.compile(r" stall=([\d.]+)ms"),
+    "stalls": re.compile(r" stall=[\d.]+ms/([\d.]+)x"),
+    "vblankReleased": re.compile(r"vblankReleased=([\d.]+)x"),
+    "vulkan worker ms": re.compile(r"vulkan worker=([\d.]+)ms"),
+    "snap hit %": re.compile(r"snap hit=([\d.]+)%"),
+    "snap volatile": re.compile(r"volatile=([\d.]+)"),
+    "snap cmd": re.compile(r"cmd=([\d.]+)"),
+    "snap copied MiB": re.compile(r"copied=([\d.]+)MiB"),
+    "snap faults": re.compile(r"faults=([\d.]+)"),
+    "snap protects": re.compile(r"protects=([\d.]+)"),
+}
+TICKS_RE = re.compile(r"gate releases=(?P<releases>\d+) ticks: (?P<ticks>.*)$")
+HFR_RE = re.compile(r"\[hfr\] (?P<text>(scheduler floor lifted|present interval|unlocked rate|"
+                    r"MojoRecompHfrSchedulerFloor saw).*)$")
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -55,6 +76,9 @@ def main(argv: list[str]) -> int:
     text = path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     perf, cpu, probes, pipeline = [], [], [], []
+    fields: dict[str, list[float]] = {name: [] for name in PIPELINE_FIELDS}
+    ticks: Counter = Counter()
+    hfr_notes: list[str] = []
     health = None
     policy = None
     for line in text:
@@ -68,6 +92,17 @@ def main(argv: list[str]) -> int:
             health = (int(m["pipelines"]), int(m["modules"]))
         elif m := PIPELINE_RE.search(line):
             pipeline.append((float(m["fps"]), float(m["frame"]), m["busiest"], int(m["share"])))
+            for name, field_re in PIPELINE_FIELDS.items():
+                if f := field_re.search(line):
+                    fields[name].append(float(f.group(1)))
+            if t := TICKS_RE.search(line):
+                releases = int(t["releases"])
+                for bucket in t["ticks"].split():
+                    name, _, share = bucket.partition("=")
+                    ticks[name] += releases * float(share.rstrip("%")) / 100.0
+        elif m := HFR_RE.search(line):
+            if m["text"] not in hfr_notes:
+                hfr_notes.append(m["text"])
         elif m := POLICY_RE.search(line):
             policy = (int(m["sim"]), int(m["pres"]))
 
@@ -137,6 +172,18 @@ def main(argv: list[str]) -> int:
         total = sum(counts.values())
         print("  busiest stage: " + ", ".join(f"{name} {100 * n / total:.0f}% of windows"
                                              for name, n in counts.most_common()))
+        print("  per frame:")
+        for name, values in fields.items():
+            if values:
+                print(f"    {name:<16} {describe(values)}")
+        total_ticks = sum(ticks.values())
+        if total_ticks:
+            print("  title update intervals (16.667 ms ticks): " + "  ".join(
+                f"{name}:{100 * n / total_ticks:.0f}%" for name, n in ticks.items()))
+    if hfr_notes:
+        print("\n[hfr] lines:")
+        for note in hfr_notes:
+            print(f"  {note}")
     return 0
 
 
