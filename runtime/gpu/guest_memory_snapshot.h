@@ -78,6 +78,14 @@ uint64_t GuestSnapshotCopiedBytes() noexcept;
 // Captures served by a fresh copy because they touch a hot writable page
 // (opt-in MOJORECOMP_SNAPSHOT_HOT_PAGES=1). The epoch advances once per swap.
 uint64_t GuestSnapshotVolatileCaptureCount() noexcept;
+// Marks guest memory the command processor executes as commands (the ring and
+// indirect buffers). The title rewrites it on every lap of its command buffer,
+// and draws read data from inside it: D3D BeginVertices, which Pure3D's
+// immediate-mode primitives use, and the resolve and clear rectangles. Small
+// captures that touch such pages are copied fresh instead of write-protected
+// (MOJORECOMP_SNAPSHOT_COMMAND_MEMORY=0 restores protection).
+void GuestSnapshotNoteCommandMemory(uint32_t address, uint64_t bytes) noexcept;
+uint64_t GuestSnapshotCommandCaptureCount() noexcept;
 void GuestSnapshotAdvanceEpoch() noexcept;
 void GuestSnapshotCacheShutdown();
 

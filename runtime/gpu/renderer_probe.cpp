@@ -250,6 +250,7 @@ void LogPipelineSummary(uint64_t swaps)
     current.snapshotWriteFaults = mojorecomp::gpu::GuestSnapshotWriteFaultCount();
     current.snapshotProtectCalls = mojorecomp::gpu::GuestSnapshotProtectCallCount();
     current.snapshotVolatileCaptures = mojorecomp::gpu::GuestSnapshotVolatileCaptureCount();
+    current.snapshotCommandCaptures = mojorecomp::gpu::GuestSnapshotCommandCaptureCount();
     mojorecomp::host::ReadPipelineCounters(current);
     if (g_havePreviousPipelineCounters)
         KLOG("%s\n", mojorecomp::host::FormatPipelineSummary(
@@ -357,6 +358,7 @@ void RendererProbe_Init()
     Pm4_SetStoreSink(OnStore);
     Pm4_SetDrawSink(OnDraw);
     Pm4_SetSwapSink(OnSwap);
+    Pm4_SetCommandMemorySink(mojorecomp::gpu::GuestSnapshotNoteCommandMemory);
     KLOG("gpu-probe attached to shader/draw/swap PM4 seams\n");
 
     const bool wantVulkan = EnvEnabled("MOJORECOMP_VULKAN_PRESENT");
@@ -457,6 +459,7 @@ void RendererProbe_Shutdown()
     Pm4_SetRegisterSink(nullptr);
     Pm4_SetDrawSink(nullptr);
     Pm4_SetSwapSink(nullptr);
+    Pm4_SetCommandMemorySink(nullptr);
     if (g_gpuCommandStream)
     {
         if (!g_gpuCommandStream->Shutdown())

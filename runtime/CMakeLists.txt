@@ -446,6 +446,14 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME GuestMemorySnapshotHotPages COMMAND MojoRecompGuestMemorySnapshotHotPagesTest)
     set_tests_properties(GuestMemorySnapshotHotPages PROPERTIES TIMEOUT 10
         LABELS "gpu;memory;performance")
+    add_executable(MojoRecompGuestMemorySnapshotCommandMemoryTest
+        tests/guest_memory_snapshot_command_memory_test.cpp
+        gpu/guest_memory_snapshot.cpp)
+    target_link_libraries(MojoRecompGuestMemorySnapshotCommandMemoryTest PRIVATE onecore)
+    add_test(NAME GuestMemorySnapshotCommandMemory
+        COMMAND MojoRecompGuestMemorySnapshotCommandMemoryTest)
+    set_tests_properties(GuestMemorySnapshotCommandMemory PROPERTIES TIMEOUT 10
+        LABELS "gpu;memory;performance")
     # Manual microbenchmark of the write-protection cost, built on request only.
     add_executable(MojoRecompSnapshotFaultBenchmark EXCLUDE_FROM_ALL
         tests/snapshot_fault_benchmark.cpp

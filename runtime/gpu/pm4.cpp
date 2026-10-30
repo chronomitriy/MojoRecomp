@@ -210,6 +210,7 @@ void (*g_registerBatchSink)(const uint32_t*, const uint32_t*, std::size_t) = nul
 void (*g_storeSink)(uint8_t*, uint32_t, uint32_t) = nullptr;
 void (*g_drawSink)(uint8_t*, const Pm4Draw&) = nullptr;
 void (*g_swapSink)(uint8_t*, uint32_t, uint32_t, uint32_t) = nullptr;
+void (*g_commandMemorySink)(uint32_t, uint64_t) = nullptr;
 
 Pm4ShaderBinding g_boundShaders[2]{};
 std::vector<uint8_t> g_shaderStaging;
@@ -1088,6 +1089,8 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                 if (size && (phys & 0x1FFFFFFFu) + uint64_t(size) * 4u <= 0x20000000ull)
                 {
                     ++g_indirectBuffers;
+                    if (g_commandMemorySink)
+                        g_commandMemorySink(PhysicalToCached(phys), uint64_t(size) * 4u);
                     if (IbProfileEnabled())
                     {
                         static std::atomic<uint32_t> reports{0};
@@ -1352,6 +1355,11 @@ void Pm4_SetSwapSink(void (*sink)(uint8_t*, uint32_t, uint32_t, uint32_t))
     g_swapSink = sink;
 }
 
+void Pm4_SetCommandMemorySink(void (*sink)(uint32_t, uint64_t))
+{
+    g_commandMemorySink = sink;
+}
+
 bool Pm4_RegisterBinkPixelShaderContainer(const uint8_t* container,
                                           std::size_t sizeBytes)
 {
@@ -1445,6 +1453,12 @@ uint32_t Pm4_Execute(uint8_t* base, uint32_t writePtr)
     const uint32_t ringDwords = g_ringDwords.load(std::memory_order_relaxed);
     if (!ringBase || !ringDwords)
         return writePtr;
+    static uint32_t notedRingBase = 0;
+    if (g_commandMemorySink && notedRingBase != ringBase)
+    {
+        notedRingBase = ringBase;
+        g_commandMemorySink(ringBase, uint64_t(ringDwords) * 4u);
+    }
 
     uint32_t cursor = g_cursor.load(std::memory_order_relaxed);
     const bool powerOfTwoRing = (ringDwords & (ringDwords - 1u)) == 0;

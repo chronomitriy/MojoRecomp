@@ -67,6 +67,7 @@ struct PipelineCounters
     uint64_t snapshotWriteFaults = 0;
     uint64_t snapshotProtectCalls = 0;
     uint64_t snapshotVolatileCaptures = 0;
+    uint64_t snapshotCommandCaptures = 0;
 
     uint64_t titleGateReleases = 0;
     uint64_t titleGateIntervals[kTitleGateIntervalBuckets]{};

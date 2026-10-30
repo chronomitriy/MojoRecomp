@@ -94,6 +94,23 @@ std::array<std::atomic<uint32_t>, kPageCount> g_pageLastFaultEpoch{};
 std::array<std::atomic<uint32_t>, kPageCount> g_pageHotUntilEpoch{};
 std::atomic<uint64_t> g_volatileCaptures{0};
 
+// Command memory (on by default, MOJORECOMP_SNAPSHOT_COMMAND_MEMORY=0 disables
+// it). The PM4 thread marks every page it executes as commands. D3D rewrites
+// those pages on every lap of its command buffer, so protecting one buys a
+// write fault per lap; small ranges touching them are copied fresh instead.
+// The same size limit as for hot pages keeps large ranges on the cache.
+std::array<std::atomic<uint8_t>, kPageCount> g_pageCommand{};
+std::atomic<uint64_t> g_commandCaptures{0};
+
+bool CommandMemoryPolicyEnabled() noexcept
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_SNAPSHOT_COMMAND_MEMORY");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
 #if defined(_WIN32)
 PVOID g_vectoredHandler = nullptr;
 
@@ -265,6 +282,14 @@ bool ProtectTrackedPages(const uint8_t* guestBase, size_t firstPage, size_t last
 }
 #endif
 
+bool RangeHasCommandPage(size_t firstPage, size_t lastPage)
+{
+    for (size_t page = firstPage; page <= lastPage; ++page)
+        if (g_pageCommand[page].load(std::memory_order_relaxed))
+            return true;
+    return false;
+}
+
 // True when the range touches a hot page that is currently writable.
 bool RangeHasHotWritablePage(size_t firstPage, size_t lastPage)
 {
@@ -363,17 +388,23 @@ bool GuestMemorySnapshot::Capture(const uint8_t* guestBase, uint32_t address, ui
                 break;
             }
 
-            // A hot page is rewritten so often that re-protecting it costs more
-            // than copying a small range every time. Such a capture is never
-            // cached: the cache only serves ranges whose pages are all tracked.
-            if (g_hotPagePolicy.load(std::memory_order_relaxed) &&
-                bytes <= kVolatileRangeLimitBytes &&
-                RangeHasHotWritablePage(firstPage, lastPage))
+            // Command memory and hot pages are rewritten so often that
+            // re-protecting them costs more than copying a small range every
+            // time. Such a capture is never cached: the cache only serves
+            // ranges whose pages are all tracked.
+            const bool commandRange = bytes <= kVolatileRangeLimitBytes &&
+                                      CommandMemoryPolicyEnabled() &&
+                                      RangeHasCommandPage(firstPage, lastPage);
+            if (commandRange ||
+                (g_hotPagePolicy.load(std::memory_order_relaxed) &&
+                 bytes <= kVolatileRangeLimitBytes &&
+                 RangeHasHotWritablePage(firstPage, lastPage)))
             {
                 auto data = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(bytes));
                 std::memcpy(data->data(), guestBase + address, static_cast<size_t>(bytes));
                 g_copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
-                g_volatileCaptures.fetch_add(1, std::memory_order_relaxed);
+                (commandRange ? g_commandCaptures : g_volatileCaptures)
+                    .fetch_add(1, std::memory_order_relaxed);
                 captured = std::move(data);
                 identity = g_nextIdentity.fetch_add(1, std::memory_order_relaxed);
                 break;
@@ -602,6 +633,22 @@ uint64_t GuestSnapshotCopiedBytes() noexcept
 uint64_t GuestSnapshotVolatileCaptureCount() noexcept
 {
     return g_volatileCaptures.load(std::memory_order_relaxed);
+}
+
+void GuestSnapshotNoteCommandMemory(uint32_t address, uint64_t bytes) noexcept
+{
+    // Marks are sticky: the title's command buffer is allocated once.
+    if (!TrackedRange(address, bytes))
+        return;
+    const size_t lastPage = LastPage(address, bytes);
+    for (size_t page = FirstPage(address); page <= lastPage; ++page)
+        if (!g_pageCommand[page].load(std::memory_order_relaxed))
+            g_pageCommand[page].store(1, std::memory_order_relaxed);
+}
+
+uint64_t GuestSnapshotCommandCaptureCount() noexcept
+{
+    return g_commandCaptures.load(std::memory_order_relaxed);
 }
 
 void GuestSnapshotAdvanceEpoch() noexcept

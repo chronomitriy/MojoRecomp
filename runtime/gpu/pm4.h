@@ -77,6 +77,9 @@ void Pm4_SetStoreSink(void (*sink)(uint8_t* base, uint32_t guestAddress,
 void Pm4_SetDrawSink(void (*sink)(uint8_t* base, const Pm4Draw& draw));
 void Pm4_SetSwapSink(void (*sink)(uint8_t* base, uint32_t frontBuffer,
                                   uint32_t width, uint32_t height));
+// Reports guest memory executed as commands: the ring once per configuration,
+// then every indirect buffer as it is executed (PM4 thread).
+void Pm4_SetCommandMemorySink(void (*sink)(uint32_t guestAddress, uint64_t bytes));
 
 // Crash's pre-rendered movies use the named binkdecompress shader container.
 // Registering its container lets PM4 derive the actual microcode hash at

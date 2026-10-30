@@ -12,6 +12,18 @@
 
 namespace {
 
+struct CommandMemoryReport
+{
+    uint32_t address = 0;
+    uint64_t bytes = 0;
+};
+std::vector<CommandMemoryReport> g_commandMemory;
+
+void RecordCommandMemory(uint32_t address, uint64_t bytes)
+{
+    g_commandMemory.push_back({address, bytes});
+}
+
 void StoreBe32(uint8_t* destination, uint32_t value)
 {
     destination[0] = static_cast<uint8_t>(value >> 24);
@@ -41,6 +53,7 @@ int main()
     store(0xA0001008u, 0x00002001u); // 8-in-16 endian
     std::memset(base + 0xA0002000u, 0xCD, 16);
     Pm4_SetRingBuffer(0xA0001000u, 4096);
+    Pm4_SetCommandMemorySink(RecordCommandMemory);
     const bool consumed = Pm4_Execute(base, 3) == 3;
     uint16_t extent[6]{};
     for (unsigned i = 0; i < 6; ++i)
@@ -82,6 +95,21 @@ int main()
     std::printf("%s: Type-0 shader constant fast path\n",
                 constantsValid ? "PASS" : "FAIL");
 
+    // Command memory is reported to the snapshot layer: the ring once, then
+    // each indirect buffer as it executes (here two type-2 NOPs).
+    store(0xA0001000u + at++ * 4u, 0xC0013F00u); // INDIRECT_BUFFER, 2 body dwords
+    store(0xA0001000u + at++ * 4u, 0x00002100u); // physical address
+    store(0xA0001000u + at++ * 4u, 2u);          // size in dwords
+    store(0xA0002100u, 0x80000000u);
+    store(0xA0002104u, 0x80000000u);
+    const bool ibConsumed = Pm4_Execute(base, at) == at;
+    const bool commandMemoryValid = ibConsumed && g_commandMemory.size() == 2 &&
+        g_commandMemory[0].address == 0xA0001000u && g_commandMemory[0].bytes == 4096u &&
+        g_commandMemory[1].address == 0xA0002100u && g_commandMemory[1].bytes == 8u;
+    Pm4_SetCommandMemorySink(nullptr);
+    std::printf("%s: ring and indirect buffers reported as command memory\n",
+                commandMemoryValid ? "PASS" : "FAIL");
+
     // A ShaderContainer uses the 0x102A11xx family. The low byte contains
     // container flags and must not make a structurally valid pixel shader fail.
     std::vector<uint8_t> binkContainer(0x24u + 12u, 0);
@@ -108,6 +136,6 @@ int main()
                     ? "PASS" : "FAIL");
 
     VirtualFree(base, 0, MEM_RELEASE);
-    return valid && constantsValid && binkFamilyValid && binkRejectsWrongFamily &&
-           binkPathValid ? 0 : 1;
+    return valid && constantsValid && commandMemoryValid && binkFamilyValid &&
+           binkRejectsWrongFamily && binkPathValid ? 0 : 1;
 }

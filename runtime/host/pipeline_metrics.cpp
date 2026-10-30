@@ -177,7 +177,7 @@ std::string FormatPipelineSummary(const PipelineCounters& previous,
         "guest cpu=%s cpWait=%.2fms/%.1fx | "
         "pm4 busy=%.2fms sink=%.2fms backpressure=%.2fms stall=%.2fms/%.1fx vblankReleased=%.1fx | "
         "vulkan worker=%.2fms | "
-        "snap hit=%.1f%% miss=%.1f volatile=%.1f copied=%.2fMiB faults=%.1f protects=%.1f | "
+        "snap hit=%.1f%% miss=%.1f volatile=%.1f cmd=%.1f copied=%.2fMiB faults=%.1f protects=%.1f | "
         "gate releases=%llu ticks: %s",
         static_cast<unsigned long long>(frames), fps, frameMs, busiest, busiestShare,
         guestText,
@@ -192,6 +192,7 @@ std::string FormatPipelineSummary(const PipelineCounters& previous,
         Ms(PerFrame(worker, frames)),
         hitRate, PerFrame(misses, frames),
         PerFrame(Delta(current.snapshotVolatileCaptures, previous.snapshotVolatileCaptures), frames),
+        PerFrame(Delta(current.snapshotCommandCaptures, previous.snapshotCommandCaptures), frames),
         PerFrame(Delta(current.snapshotCopiedBytes, previous.snapshotCopiedBytes), frames) /
             (1024.0 * 1024.0),
         PerFrame(Delta(current.snapshotWriteFaults, previous.snapshotWriteFaults), frames),

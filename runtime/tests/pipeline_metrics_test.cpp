@@ -72,6 +72,7 @@ int main()
     current.snapshotWriteFaults = 40;
     current.snapshotProtectCalls = 8;
     current.snapshotVolatileCaptures = 12;
+    current.snapshotCommandCaptures = 20;
 
     const std::string line = FormatPipelineSummary(previous, current);
     const char* expected[] = {
@@ -79,7 +80,7 @@ int main()
         "guest cpu=22.50ms(90%) cpWait=1.00ms/0.5x",
         "pm4 busy=9.00ms sink=5.00ms backpressure=1.00ms stall=0.38ms/0.5x vblankReleased=0.2x",
         "vulkan worker=12.00ms",
-        "snap hit=90.0% miss=25.0 volatile=3.0 copied=1.00MiB faults=10.0 protects=2.0",
+        "snap hit=90.0% miss=25.0 volatile=3.0 cmd=5.0 copied=1.00MiB faults=10.0 protects=2.0",
         "gate releases=4 ticks: <1=0% 1=75% 1.5=0% 2=25% 2.5=0% 3=0% >3=0%",
     };
     for (const char* needle : expected)
