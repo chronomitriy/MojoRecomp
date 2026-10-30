@@ -19918,6 +19918,20 @@ name = "MojoRecompHfrSkipProgressWait"
 registers = []
 jump_address_on_true = 0x8238F048
 
+# After that reconciliation, the "exactly one vblank elapsed" branch selects
+# D3D present interval ONE (li r29,1 at 0x8238F074); every other branch keeps
+# the D3DPRESENT_INTERVAL_IMMEDIATE value loaded into r29 on entry. With
+# interval ONE, D3D's swap callback (0x82273A40) defers the flip to the next
+# vblank, and the command processor waits on a scratch register that only the
+# vblank handler (0x822738D0) clears, ahead of the XE_SWAP that presents the
+# frame. In HFR, branch past the li so the flip happens at once; the host
+# presenter applies the user's VSync setting. Compatibility mode returns false.
+[[midasm_hook]]
+address = 0x8238F060
+name = "MojoRecompHfrPresentImmediate"
+registers = []
+jump_address_on_true = 0x8238F078
+
 # sub_82230198 contains two state-machine loops that busy-wait while the
 # asynchronous backend reports status 4. With the outer scheduler released at
 # 60 Hz, that wait still blocks the main thread for roughly one 30 Hz worker

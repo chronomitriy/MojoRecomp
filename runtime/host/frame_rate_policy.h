@@ -374,6 +374,22 @@ constexpr bool TitleProgressWaitBypass(FrameRatePolicy policy) noexcept
            policy.requiresTitlePatches;
 }
 
+// After its progress check, the mode-1 path asks D3D for present interval ONE
+// when exactly one vblank has passed since the previous present, and for the
+// immediate interval otherwise. With interval ONE, D3D's swap callback defers
+// the flip to the next vblank, and the command processor then waits on a
+// scratch value that only the vblank interrupt clears. The host present
+// (XE_SWAP) follows that wait, so every such frame is held until the next
+// 60 Hz guest vblank. HFR takes the immediate branch instead and leaves
+// tearing and VSync to the host presenter; compatibility mode keeps the
+// title's own vblank-synchronised flips.
+constexpr bool TitlePresentImmediate(FrameRatePolicy policy) noexcept
+{
+    policy = HighFrameRate60TitleContract(policy);
+    return policy.mode == FrameRateMode::HighFrameRate60 &&
+           policy.requiresTitlePatches;
+}
+
 // One title-side async state machine spins inside a single update while its
 // worker reports status 4 (pending). On the original 30 FPS path that blocking
 // poll is part of the observed cadence. Once the outer scheduler is released at

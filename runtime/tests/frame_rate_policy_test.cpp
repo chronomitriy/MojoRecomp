@@ -223,6 +223,51 @@ TickResult SimulateTitleTick(double floorSeconds, uint64_t durationUs, uint32_t 
     return result;
 }
 
+struct PresentPathResult
+{
+    uint32_t heldFrames = 0; // XE_SWAP waited for a later guest vblank
+    uint64_t heldUs = 0;
+};
+
+// Models the decompiled present path. Title (0x8238EFE8, mode 1 with the HFR
+// progress hooks): interval ONE when exactly one vblank passed since the last
+// present, immediate otherwise. D3D: the swap callback (0x82273A40, immediate
+// threshold 0) flips now or queues the flip for a target vblank, and the
+// command processor waits until the vblank handler (0x822738D0) performs it.
+PresentPathResult SimulatePresentPath(bool presentImmediate, uint32_t frameUs,
+                                      uint32_t cpLagUs, uint32_t frames)
+{
+    constexpr uint32_t kVblankUs = 16667;
+    PresentPathResult result;
+    uint32_t titleLastCounter = 0; // this+1668
+    uint32_t lastTarget = 0;       // dev+16404
+    uint64_t cpFreeAt = 0;
+    for (uint32_t k = 1; k <= frames; ++k)
+    {
+        const uint64_t presentAt = uint64_t(k) * frameUs;
+        const uint32_t counter = static_cast<uint32_t>(presentAt / kVblankUs);
+        const uint32_t elapsedVblanks = counter - titleLastCounter;
+        titleLastCounter = counter;
+        const uint32_t interval = elapsedVblanks == 1 && !presentImmediate ? 1u : 0u;
+
+        const uint64_t callbackAt = std::max<uint64_t>(presentAt + cpLagUs, cpFreeAt);
+        const uint32_t vblanks = static_cast<uint32_t>(callbackAt / kVblankUs);
+        uint32_t target = lastTarget + interval;
+        if (target <= vblanks)
+            target = interval ? vblanks + 1u : vblanks;
+        lastTarget = target;
+        uint64_t swapAt = callbackAt;
+        if (target != vblanks)
+        {
+            swapAt = uint64_t(target) * kVblankUs;
+            ++result.heldFrames;
+            result.heldUs += swapAt - callbackAt;
+        }
+        cpFreeAt = swapAt;
+    }
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -244,6 +289,7 @@ int main()
     using mojorecomp::host::TitleFrameGateElapsedUsPhased;
     using mojorecomp::host::TitleGpuPollCooperative;
     using mojorecomp::host::TitlePolicyForNativeCadenceContent;
+    using mojorecomp::host::TitlePresentImmediate;
     using mojorecomp::host::TitleProgressCadenceCounter;
     using mojorecomp::host::TitleProgressWaitBypass;
     using mojorecomp::host::TitleSchedulerFloorSeconds;
@@ -317,6 +363,9 @@ int main()
         return Fail("60 FPS progress cadence no longer cancels exactly one look-ahead tick");
     if (TitleProgressWaitBypass(active) || !TitleProgressWaitBypass(high))
         return Fail("progress wait bypass lost its HFR-only safety contract");
+    if (TitlePresentImmediate(active) || !TitlePresentImmediate(high) ||
+        TitlePresentImmediate(video))
+        return Fail("immediate present interval lost its HFR-only safety contract");
 
     if (TitleAsyncPollShouldYield(4u, active))
         return Fail("30 FPS compatibility mode unexpectedly yields the async poll");
@@ -385,6 +434,9 @@ int main()
                     return Fail("30/60 progress cadence differs from 0.2.0");
             if (TitleProgressWaitBypass(policy) != reference::TitleProgressWaitBypass(policy))
                 return Fail("30/60 progress wait bypass differs from 0.2.0");
+            // New in this branch, and only where the 0.2.0 HFR progress hooks apply.
+            if (TitlePresentImmediate(policy) != reference::TitleProgressWaitBypass(policy))
+                return Fail("immediate present interval reaches a non-HFR policy");
             for (uint32_t status = 0; status < 16u; ++status)
                 if (TitleAsyncPollShouldYield(status, policy) !=
                     reference::TitleAsyncPollShouldYield(status, policy))
@@ -433,6 +485,24 @@ int main()
                                             [](uint32_t) { return 9000u; });
         if (fast.intervalsUs.size() < 598u || fast.intervalsUs.size() > 600u)
             return Fail("the HFR gate drifted away from 60 Hz for fast scenes");
+    }
+
+    // --- The HFR present path no longer waits for guest vblanks. -----------
+    {
+        // A 40 FPS scene: with the title's own choice, the frames presented
+        // exactly one vblank after the previous one get interval ONE, and the
+        // command processor holds their XE_SWAP for the next vblank.
+        const bool hfrImmediate = TitlePresentImmediate(high);
+        const auto titleDefault = SimulatePresentPath(false, 25000u, 3000u, 600u);
+        const auto hooked = SimulatePresentPath(hfrImmediate, 25000u, 3000u, 600u);
+        if (titleDefault.heldFrames < 100u || titleDefault.heldUs < 100u * 1000u)
+            return Fail("present-path model no longer shows the vblank hold it documents");
+        if (hooked.heldFrames != 0u || hooked.heldUs != 0u)
+            return Fail("an HFR present was still held for a guest vblank");
+        // At a steady 60 every frame took interval ONE; none is held now.
+        if (SimulatePresentPath(false, 16667u, 3000u, 600u).heldFrames < 590u ||
+            SimulatePresentPath(hfrImmediate, 16667u, 3000u, 600u).heldFrames != 0u)
+            return Fail("steady 60 FPS presents are still held for a guest vblank");
     }
 
     // --- Unlocked rates above 60 Hz. ---------------------------------------
@@ -486,7 +556,10 @@ int main()
         // Progress, wait, async and GPU-poll hooks keep the 60 Hz contract.
         if (TitleProgressCadenceCounter(101u, u144) != 100u ||
             !TitleProgressWaitBypass(u144) || !TitleAsyncPollShouldYield(4u, u144) ||
-            TitleAsyncPollShouldYield(3u, u144) || !TitleGpuPollCooperative(u144))
+            TitleAsyncPollShouldYield(3u, u144) || !TitleGpuPollCooperative(u144) ||
+            !TitlePresentImmediate(u144) ||
+            !TitlePresentImmediate(EffectiveTitleFrameRatePolicy(u144, false)) ||
+            TitlePresentImmediate(TitlePolicyForNativeCadenceContent(u144, true)))
             return Fail("unlocked mode changed the 60 Hz progress-hook contract");
         if (!SamePolicy(TitlePolicyForNativeCadenceContent(u144, true),
                         PolicyFor(FrameRateMode::Compatibility30)))

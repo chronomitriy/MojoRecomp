@@ -81,6 +81,16 @@ bool ProgressDiagnosticsEnabled() {
     return value && value[0] == '1';
 }
 
+// A/B switch for MojoRecompHfrPresentImmediate: keep the title's own
+// vblank-synchronised present interval in the HFR modes.
+bool HfrGuestVsyncRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("MOJORECOMP_HFR_GUEST_VSYNC");
+        return value && value[0] == '1';
+    }();
+    return requested;
+}
+
 uint32_t GpuPollYieldInterval() {
     static const uint32_t interval = [] {
         const char* value = std::getenv("MOJORECOMP_GPU_POLL_YIELD");
@@ -229,6 +239,23 @@ bool MojoRecompHfrSkipProgressWait() {
         MojoRecompHfrDiscoveryObserve("progress-wait", kHfrProgressWaitSite);
     return mojorecomp::host::TitleProgressWaitBypass(
         ActiveTitleFrameRatePolicy());
+}
+
+// Placed on the `b` that leads the mode-1 "one vblank elapsed" branch to
+// `li r29,1` (present interval ONE). Returning true jumps past it, so r29 keeps
+// the D3DPRESENT_INTERVAL_IMMEDIATE value the function loaded on entry.
+bool MojoRecompHfrPresentImmediate() {
+    if (!mojorecomp::host::TitlePresentImmediate(ActiveTitleFrameRatePolicy()))
+        return false;
+    const bool guestVsync = HfrGuestVsyncRequested();
+    static std::atomic<bool> announced{false};
+    if (!announced.load(std::memory_order_relaxed) && !announced.exchange(true))
+        std::fprintf(stderr, guestVsync
+            ? "[hfr] present interval: title default (MOJORECOMP_HFR_GUEST_VSYNC=1); "
+              "on-time frames wait for the next guest vblank\n"
+            : "[hfr] present interval: immediate; D3D no longer holds on-time frames "
+              "for the next guest vblank\n");
+    return !guestVsync;
 }
 
 bool MojoRecompHfrYieldAsyncPoll(PPCRegister& status) {
