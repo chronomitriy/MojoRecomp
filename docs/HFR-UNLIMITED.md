@@ -12,6 +12,9 @@ unit-tested in a cloud container. Nothing was run against Crash of the Titans.
 > enables part of the register localization experimentally and stops write-protecting
 > command memory. Where this file says something can only be found with the game, the
 > answer is now there; statements it corrects are marked "Phase 2:".
+>
+> **Phase 3 update.** [HFR-PHASE3.md](HFR-PHASE3.md) removes the swap handshake's wait for
+> the Vulkan thread, wakes the PM4 pump promptly and speeds up the vertex path.
 
 ## Contents
 
@@ -512,3 +515,5 @@ Compare every item against the 60 FPS mode on the same save. The fastest objecti
 | `MOJORECOMP_DETAILED_CPU_PROFILE=0` | Turns off the per-draw profiler timers and the `Vulkan CPU profile` line (existing) |
 
 Phase 2 adds `MOJORECOMP_HFR_GUEST_VSYNC` and `MOJORECOMP_SNAPSHOT_COMMAND_MEMORY` ([HFR-PHASE2 9](HFR-PHASE2.md#9-environment-variables)).
+Phase 3 adds `MOJORECOMP_CP_TIME_SIGNALS`, `MOJORECOMP_PM4_FRAMES_AHEAD`,
+`MOJORECOMP_PM4_PROMPT_WAKE` and `MOJORECOMP_VERTEX_FAST_PATH` ([HFR-PHASE3 10](HFR-PHASE3.md#10-environment-variables)).

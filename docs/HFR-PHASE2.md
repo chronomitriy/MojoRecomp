@@ -279,7 +279,9 @@ jump_address_on_true = 0x8238F078
   2.1). Each swap therefore still waits for the Vulkan thread to translate the frame's
   draws. That wait is not tied to vblank and will show as short `stall` episodes that are
   not vblank-released. Delivering this interrupt early is not safe in general, so it is
-  left as is.
+  left as is. **Phase 3:** in heavy scenes this wait is most of the frame (step 1's
+  write-back is queued too). [HFR-PHASE3.md](HFR-PHASE3.md) shows why GPU stores and
+  interrupts can take effect at CP time in this runtime and does so in the HFR modes.
 - Mode 0 (interval ONE without the wait loop) is not hooked. Gameplay uses mode 1; if some
   menu uses mode 0, it stays vsynced at 60.
 - If FPS still plateaus with `vblankReleased` near 0, the remaining limit is CPU time:
