@@ -44,8 +44,10 @@ mojorecomp::host::FrameRatePolicy ActiveTitleFrameRatePolicy()
         mojorecomp::host::EffectiveActiveFrameRatePolicy(), Pm4_BinkVideoCadenceActive());
 }
 
-// One-time notice when an unlocked rate is requested but this build has no
-// scheduler-floor hook, so the title necessarily stays at 60 Hz.
+// One-time notice when an unlocked rate is requested but the scheduler-floor
+// hook has not run, so the title necessarily stays at 60 Hz. The frame gate
+// only runs while a state transition loads; the floor hook runs from the first
+// Game::Tick, so a long loading screen alone can print this.
 void NoteUnlockedRateHeldAt60()
 {
     const auto requested = mojorecomp::host::ActiveFrameRatePolicy();
@@ -56,9 +58,10 @@ void NoteUnlockedRateHeldAt60()
     if (++releases != 900u) // ~15 s at 60 Hz
         return;
     std::fprintf(stderr,
-        "[hfr] unlocked rate %u Hz%s requested, but MojoRecompHfrSchedulerFloor has not run: "
-        "the title stays at 60 Hz. Locate the floor with MOJORECOMP_HFR_DISCOVERY=1 "
-        "(docs/HFR-UNLIMITED.md).\n",
+        "[hfr] unlocked rate %u Hz%s requested, but MojoRecompHfrSchedulerFloor has not run "
+        "yet: the title stays at 60 Hz. It runs from the first Game::Tick update after "
+        "loading; if it never does, check the 0x821FC1C8 hook in "
+        "config/CrashOfTheTitans.toml (docs/HFR-PHASE2.md).\n",
         requested.presentationHz, requested.uncapped ? " (uncapped)" : "");
 }
 
@@ -173,11 +176,12 @@ void MojoRecompHfrFrameGate(PPCRegister& elapsedUs) {
 }
 
 // Lowers the title's 1/60 s scheduler floor for the unlocked frame rates. The
-// address is title-specific and has to be located on a machine with the game
-// (MOJORECOMP_HFR_DISCOVERY=1); the hook is installed by adding the printed
-// [[midasm_hook]] block, after the instruction that loads the floor, to
-// config/CrashOfTheTitans.toml. 30/60 FPS never touch the register, and only a
-// register that really holds 1/60 s is rewritten or unlocks the outer gate.
+// floor is the `lfs f13` at 0x821FC1C8 in Game::Tick (0x821FC198), the
+// gameplay update the title loop calls on every pass; see the hook block in
+// config/CrashOfTheTitans.toml. This one-register form is what
+// MOJORECOMP_HFR_DISCOVERY prints for other candidates. 30/60 FPS never touch
+// the register, and only a register that really holds 1/60 s is rewritten or
+// unlocks the outer gate.
 void MojoRecompHfrSchedulerFloor(PPCRegister& floor) {
     const auto requested = mojorecomp::host::ActiveFrameRatePolicy();
     if (requested.mode != mojorecomp::host::FrameRateMode::HighFrameRateUnlocked)
@@ -196,6 +200,21 @@ void MojoRecompHfrSchedulerFloor(PPCRegister& floor) {
             "[hfr] scheduler floor lifted: 16.667 ms -> %.3f ms; title gate now %u Hz%s\n",
             floor.f64 * 1000.0, requested.presentationHz,
             requested.uncapped ? " (uncapped ceiling)" : "");
+}
+
+// Form used at the verified Game::Tick site: f13 holds the floor just loaded
+// and f0 the accumulated step that `fcmpu cr6,f0,f13; blt` compares with it.
+// Gameplay updates are dispatched here rather than through the r28 frame gate
+// (which only runs during asynchronous state transitions), so this also feeds
+// the [pipeline] gate interval histogram in every mode.
+void MojoRecompHfrSchedulerFloor(PPCRegister& floor, PPCRegister& accumulated) {
+    const bool genuineFloor = mojorecomp::host::IsTitleSchedulerFloorValue(floor.f64);
+    MojoRecompHfrSchedulerFloor(floor);
+    // The guest skips the update only when the sum is below the floor.
+    if (!genuineFloor || !(accumulated.f64 >= floor.f64))
+        return;
+    const double intervalUs = accumulated.f64 < 60.0 ? accumulated.f64 * 1.0e6 : 60.0e6;
+    mojorecomp::host::NoteTitleFrameGateRelease(static_cast<uint32_t>(intervalUs + 0.5));
 }
 
 void MojoRecompHfrProgressCadence(PPCRegister& lookaheadCounter) {

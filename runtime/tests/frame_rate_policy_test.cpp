@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -177,6 +178,47 @@ LoopResult SimulateTitleLoop(Gate&& gate, uint64_t durationUs, uint32_t pollUs,
         {
             now += pollUs;
         }
+    }
+    return result;
+}
+
+struct TickResult
+{
+    uint64_t updates = 0;
+    double updatedSeconds = 0.0; // sum of the steps the updates received
+    double shortestStep = 1.0e9;
+};
+
+// Models the gameplay path of the title loop (guest 0x821FCFB8) and Game::Tick
+// (0x821FC198) as decompiled: every loop pass stores its timestamp and calls
+// Tick with the real delta since the previous pass (a float, us * 1e-6f).
+// Tick adds it to a float accumulator and returns while the sum is below the
+// floor; the update receives the whole sum, clamped to 0.1 s, and resets it.
+template <typename Work>
+TickResult SimulateTitleTick(double floorSeconds, uint64_t durationUs, uint32_t passUs,
+                             Work&& workUs)
+{
+    TickResult result;
+    float accumulator = 0.0f;
+    uint64_t now = 0;
+    uint64_t lastPass = 0;
+    uint32_t frame = 0;
+    while (now < durationUs)
+    {
+        const float dt = float(now - lastPass) * 1.0e-6f;
+        lastPass = now;
+        accumulator = float(double(dt) + double(accumulator));
+        if (double(accumulator) < floorSeconds)
+        {
+            now += passUs;
+            continue;
+        }
+        const float step = accumulator > 0.1f ? 0.1f : accumulator;
+        ++result.updates;
+        result.updatedSeconds += step;
+        result.shortestStep = std::min(result.shortestStep, double(step));
+        accumulator = 0.0f;
+        now += passUs + workUs(frame++);
     }
     return result;
 }
@@ -494,15 +536,47 @@ int main()
             IsTitleSchedulerFloorValue(1.0 / 30.0) || IsTitleSchedulerFloorValue(0.0))
             return Fail("scheduler floor detection is too loose or too strict");
         const double floor144 = TitleSchedulerFloorSeconds(floatSixtieth, u144);
-        if (floor144 < 0.8 / 144.0 - 1.0e-12 || floor144 > 0.8 / 144.0 + 1.0e-12)
-            return Fail("unlocked scheduler floor is not 80% of the gate period");
+        if (floor144 < 1.0 / 144.0 - 1.0e-12 || floor144 > 1.0 / 144.0 + 1.0e-12)
+            return Fail("unlocked scheduler floor is not the target period");
         if (TitleSchedulerFloorSeconds(0.5, u144) != 0.5)
             return Fail("a non-floor register value was rewritten");
         const double floorUncapped =
             TitleSchedulerFloorSeconds(floatSixtieth, PolicyForSetting("uncapped"));
-        if (floorUncapped < 0.8 / kUnlockedMaxHz - 1.0e-12 ||
-            floorUncapped > 0.8 / kUnlockedMaxHz + 1.0e-12)
+        if (floorUncapped < 1.0 / kUnlockedMaxHz - 1.0e-12 ||
+            floorUncapped > 1.0 / kUnlockedMaxHz + 1.0e-12)
             return Fail("uncapped floor does not keep the safety ceiling");
+
+        // Game::Tick: the update rate follows the floor, and every second of
+        // real time reaches the updates (the accumulator never drops a step).
+        for (const auto& c : kSettings)
+        {
+            const auto policy = PolicyForSetting(c.value);
+            const double floor = TitleSchedulerFloorSeconds(floatSixtieth, policy);
+            for (uint32_t passUs : {40u, 400u, 1100u})
+            {
+                const auto run = SimulateTitleTick(floor, 10'000'000ull, passUs,
+                                                   [](uint32_t) { return 1500u; });
+                const double expected = 10.0 * c.hz;
+                const double got = double(run.updates);
+                // A pass that crosses the floor overshoots it by at most one pass.
+                const double slowest = 10.0e6 / (1.0e6 / c.hz + passUs);
+                if (got > expected + 1.0 || got < slowest - 2.0)
+                    return Fail("Game::Tick with the unlocked floor misses its target rate");
+                if (run.updatedSeconds < 10.0 - 0.1 - 1.0e-3 || run.updatedSeconds > 10.0 + 1.0e-3)
+                    return Fail("Game::Tick with the unlocked floor lost or invented time");
+                if (run.shortestStep < floor - 1.0e-9)
+                    return Fail("Game::Tick dispatched a step below the floor");
+            }
+        }
+        // The guest floor itself still caps the 60 FPS policy at 60 Hz.
+        {
+            const double floor60 = TitleSchedulerFloorSeconds(
+                floatSixtieth, PolicyFor(FrameRateMode::HighFrameRate60));
+            const auto run = SimulateTitleTick(floor60, 10'000'000ull, 40u,
+                                               [](uint32_t) { return 1500u; });
+            if (floor60 != floatSixtieth || run.updates > 600u || run.updates < 590u)
+                return Fail("the 60 FPS policy no longer runs Game::Tick at 60 Hz");
+        }
 
         if (std::string_view(FrameRateModeName(FrameRateMode::HighFrameRateUnlocked)) !=
                 "hfr-unlocked" ||

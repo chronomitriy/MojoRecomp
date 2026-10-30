@@ -19884,11 +19884,14 @@ address = 0x8226D984
 name = "MojoRecompGpuPollBackoff"
 registers = ["r31", "r29"]
 
-# The normal title loop measures elapsed microseconds in r28 and only dispatches
-# its frame/update virtual when r28 > 33333 (~30 Hz).  The downstream scheduler
-# already uses a 1/60-second minimum and receives the unmodified real delta in
-# f1.  In HFR mode, scale only r28 immediately before the gate comparison; this
-# releases the existing scheduler at ~60 Hz without speeding up guest time.
+# The title loop (0x821FCFB8) measures elapsed microseconds in r28. Gameplay
+# calls Game::Tick (vtable +40, see MojoRecompHfrSchedulerFloor below) on every
+# pass. While an asynchronous state transition is loading (this+152 bit 0x40)
+# or subsystem 17 is entering a state (its +648 byte), the loop instead
+# dispatches the reduced update at vtable +44, and only when r28 > 33333
+# (~30 Hz). That update receives the unmodified real delta in f1. In HFR mode,
+# scale only r28 immediately before the gate comparison; this releases it at
+# ~60 Hz without speeding up guest time.
 [[midasm_hook]]
 address = 0x821FD15C
 name = "MojoRecompHfrFrameGate"
@@ -19932,3 +19935,17 @@ address = 0x82230470
 name = "MojoRecompHfrYieldAsyncPoll"
 registers = ["r3"]
 jump_address_on_true = 0x8223053C
+
+# Game::Tick (0x821FC198), the gameplay update the title loop calls on every
+# pass, adds the real delta to an accumulator at this+144 and returns while the
+# sum is below 1/60 s; the update that runs receives the whole sum, and the sum
+# is clamped to 0.1 s. A refused step is therefore carried, never lost. This
+# hook runs right after `lfs f13,-4240(r11)` loads that 1/60 s floor (from
+# 0x8201EF70) and before `fcmpu cr6,f0,f13` compares the sum in f0 with it. The
+# unlocked frame rates lower f13 to the target period, which also trips the
+# interlock that holds them at 60 until then. 30/60 FPS leave f13 unchanged.
+[[midasm_hook]]
+address = 0x821FC1C8
+name = "MojoRecompHfrSchedulerFloor"
+registers = ["f13", "f0"]
+after_instruction = true

@@ -44,8 +44,9 @@ inline constexpr uint32_t kUnlockedDefaultHz = 120;
 // MojoRecompHfrFrameGate hook in config/CrashOfTheTitans.toml).
 inline constexpr uint32_t kTitleFrameGateThresholdUs = 33333;
 
-// The title's mode-1 scheduler refuses steps shorter than 1/60 s. Rates above
-// 60 Hz are impossible until that floor is lowered by MojoRecompHfrSchedulerFloor.
+// The title's update (Game::Tick, guest 0x821FC198) refuses steps shorter than
+// 1/60 s. Rates above 60 Hz are impossible until that floor is lowered by
+// MojoRecompHfrSchedulerFloor.
 inline constexpr double kTitleSchedulerFloorSeconds = 1.0 / 60.0;
 
 struct TitleFrameGatePhase
@@ -182,11 +183,12 @@ constexpr bool IsTitleSchedulerFloorValue(double seconds) noexcept
            seconds < kTitleSchedulerFloorSeconds + 1.0e-6;
 }
 
-// Unlocked floor: 80% of the requested gate period. A step released by the
-// outer gate is at least one full period long on the title's clock, so it can
-// never be refused (or clamped up) by a floor sitting at the period itself
-// when both clocks are a few microseconds apart. The floor still rejects
-// pathological near-zero steps. Every other mode returns the guest value.
+// Unlocked floor: exactly the requested period. The floor is an accumulator
+// (Game::Tick, guest 0x821FC198): each main-loop pass adds its real delta, the
+// update is skipped while the sum is below the floor, and the update that does
+// run receives the whole sum. A refused step is therefore never lost, and on
+// the gameplay path no outer gate exists, so the floor itself sets the update
+// rate. Every other mode returns the guest value.
 constexpr double TitleSchedulerFloorSeconds(double guestFloorSeconds,
                                             FrameRatePolicy requested) noexcept
 {
@@ -195,7 +197,7 @@ constexpr double TitleSchedulerFloorSeconds(double guestFloorSeconds,
         !IsTitleSchedulerFloorValue(guestFloorSeconds))
         return guestFloorSeconds;
 
-    const double floor = 0.8 / double(requested.presentationHz);
+    const double floor = 1.0 / double(requested.presentationHz);
     return floor < guestFloorSeconds ? floor : guestFloorSeconds;
 }
 
