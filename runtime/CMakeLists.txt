@@ -320,6 +320,30 @@ else()
         "-include" "${CMAKE_CURRENT_SOURCE_DIR}/cpu/timebase.h")
 endif()
 
+# Differential test of the native libc hooks against the translated originals.
+# It links the translated image without the host runtime, so every import and
+# every other mid-asm hook gets a link stub that aborts if reached.
+if(BUILD_TESTING)
+    set(MOJORECOMP_GUEST_TEST_STUBS "${CMAKE_CURRENT_BINARY_DIR}/generated/guest_test_stubs.cpp")
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" "${MOJORECOMP_ROOT}/tools/gen_guest_test_stubs.py"
+            "${PPC_DIR}" "${MOJORECOMP_GUEST_TEST_STUBS}"
+            MojoRecompGuestMemcpy MojoRecompGuestCopyForward MojoRecompGuestMemset
+        RESULT_VARIABLE GUEST_TEST_STUB_RESULT)
+    if(NOT GUEST_TEST_STUB_RESULT EQUAL 0)
+        message(FATAL_ERROR "Could not generate guest test stubs")
+    endif()
+    add_executable(MojoRecompGuestNativeTest
+        tests/guest_native_test.cpp
+        guest_native.cpp
+        runtime_state.cpp
+        cpu/timebase.cpp
+        "${MOJORECOMP_GUEST_TEST_STUBS}")
+    target_link_libraries(MojoRecompGuestNativeTest PRIVATE mojorecomp_ppc)
+    add_test(NAME GuestNative COMMAND MojoRecompGuestNativeTest)
+    set_tests_properties(GuestNative PROPERTIES TIMEOUT 60 LABELS "cpu;performance")
+endif()
+
 # Xenos shader translation is linked in-process.  The title hands us raw shader
 # microcode through PM4; this keeps translation out of an external-process path and
 # gives the renderer a direct microcode -> HLSL -> SPIR-V seam.
@@ -436,7 +460,8 @@ set(MOJORECOMP_KERNEL_SOURCES
     runtime_state.cpp
     title_resources.cpp
     title_hooks.cpp
-    title_hfr_discovery.cpp)
+    title_hfr_discovery.cpp
+    guest_native.cpp)
 
 if(BUILD_TESTING AND WIN32)
     add_executable(MojoRecompGuestMemorySnapshotHotPagesTest

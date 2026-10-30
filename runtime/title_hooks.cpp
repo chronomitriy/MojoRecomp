@@ -144,31 +144,6 @@ uint8_t GuestLoadU8(uint32_t address) {
 
 } // namespace
 
-// The title's libc memcpy at 0x823CEC90 is a forward copy routine. Guest RAM is
-// already a contiguous host mapping, so execute large non-overlapping copies on
-// the host while preserving the original forward-copy behavior for overlap.
-void MojoRecompGuestMemcpy(PPCRegister& dst, PPCRegister& src, PPCRegister& size) {
-    const uint32_t dstAddress = dst.u32;
-    const uint32_t srcAddress = src.u32;
-    const uint32_t byteCount = size.u32;
-    if (!byteCount || dstAddress == srcAddress || !g_mojoGuestBase)
-        return;
-
-    auto* dstBytes = g_mojoGuestBase + dstAddress;
-    const auto* srcBytes = g_mojoGuestBase + srcAddress;
-    const uint64_t dstEnd = uint64_t(dstAddress) + byteCount;
-    const uint64_t srcEnd = uint64_t(srcAddress) + byteCount;
-    const bool overlaps = uint64_t(dstAddress) < srcEnd &&
-                          uint64_t(srcAddress) < dstEnd;
-    if (!overlaps) {
-        std::memcpy(dstBytes, srcBytes, byteCount);
-        return;
-    }
-
-    for (uint32_t i = 0; i < byteCount; ++i)
-        dstBytes[i] = srcBytes[i];
-}
-
 void MojoRecompHfrFrameGate(PPCRegister& elapsedUs) {
     static thread_local mojorecomp::host::TitleFrameGatePhase gatePhase;
     const uint32_t measuredUs = elapsedUs.u32;

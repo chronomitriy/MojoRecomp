@@ -19871,14 +19871,30 @@ name = "MojoRecompDecoderFillStalled"
 registers = ["r25", "r22"]
 jump_address_on_true = 0x822CC6E4
 
-# Native equivalent of the title's forward-copy libc routine. Guest RAM is a
-# contiguous host mapping, so large streaming copies do not need to execute the
-# original PPC byte/word/dword loops instruction by instruction.
+# Native equivalents of the title's libc copy and fill routines
+# (runtime/guest_native.cpp). Guest RAM is a contiguous host mapping, so copies
+# and fills do not need to execute the original PPC byte/word/dword loops
+# instruction by instruction. Each hook returns false, and the original code
+# runs, whenever a flat host copy could differ from it (overlap, also through
+# the physical alias views, or a range leaving the guest space).
+# MOJORECOMP_NATIVE_GUEST_CRT=0 runs the original code only.
 [[midasm_hook]]
 address = 0x823CEC90
 name = "MojoRecompGuestMemcpy"
 registers = ["r3", "r4", "r5"]
-return = true
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x823CF0E8
+name = "MojoRecompGuestCopyForward"
+registers = ["r3", "r4", "r5"]
+return_on_true = true
+
+[[midasm_hook]]
+address = 0x823CF440
+name = "MojoRecompGuestMemset"
+registers = ["r3", "r4", "r5"]
+return_on_true = true
 
 # The original Xenon poll includes db16cyc backoff before rereading the CP
 # progress pointer. XenonRecomp currently emits db16cyc as a no-op. Restore the
