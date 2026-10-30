@@ -78,4 +78,32 @@ private:
 void WaitFor(std::chrono::nanoseconds duration) noexcept;
 void WaitUntil(SteadyClock::time_point deadline) noexcept;
 
+// A short wait that ends at its timeout or when another thread calls Wake,
+// whichever comes first. std::condition_variable::wait_for rounds a timeout up
+// to whole milliseconds on Windows, and the wait then ends on the next process
+// timer tick (15.6 ms unless the process raised the timer resolution); here
+// the timeout is a high-resolution waitable timer instead.
+class WakeableTimedWait
+{
+public:
+    WakeableTimedWait() noexcept;
+    ~WakeableTimedWait();
+
+    WakeableTimedWait(const WakeableTimedWait&) = delete;
+    WakeableTimedWait& operator=(const WakeableTimedWait&) = delete;
+
+    // Any thread. A Wake with nobody waiting makes the next Wait return at once.
+    void Wake() noexcept;
+    // One waiting thread at a time. True when woken, false on timeout.
+    bool Wait(std::chrono::nanoseconds timeout) noexcept;
+
+private:
+#ifdef _WIN32
+    void* event_ = nullptr;
+#else
+    struct State;
+    State* state_ = nullptr;
+#endif
+};
+
 } // namespace mojorecomp::host

@@ -499,6 +499,14 @@ int main()
             return Fail("present-path model no longer shows the vblank hold it documents");
         if (hooked.heldFrames != 0u || hooked.heldUs != 0u)
             return Fail("an HFR present was still held for a guest vblank");
+
+        // Phase 3 CP-time signals follow the same HFR-only contract: never in
+        // the 30 FPS mode or during native-cadence video.
+        if (mojorecomp::host::CommandProcessorTimeSignals(active) ||
+            !mojorecomp::host::CommandProcessorTimeSignals(high) ||
+            mojorecomp::host::CommandProcessorTimeSignals(
+                TitlePolicyForNativeCadenceContent(high, true)))
+            return Fail("CP-time signals are not limited to the HFR title policy");
         // At a steady 60 every frame took interval ONE; none is held now.
         if (SimulatePresentPath(false, 16667u, 3000u, 600u).heldFrames < 590u ||
             SimulatePresentPath(hfrImmediate, 16667u, 3000u, 600u).heldFrames != 0u)
@@ -559,7 +567,12 @@ int main()
             TitleAsyncPollShouldYield(3u, u144) || !TitleGpuPollCooperative(u144) ||
             !TitlePresentImmediate(u144) ||
             !TitlePresentImmediate(EffectiveTitleFrameRatePolicy(u144, false)) ||
-            TitlePresentImmediate(TitlePolicyForNativeCadenceContent(u144, true)))
+            TitlePresentImmediate(TitlePolicyForNativeCadenceContent(u144, true)) ||
+            !mojorecomp::host::CommandProcessorTimeSignals(u144) ||
+            !mojorecomp::host::CommandProcessorTimeSignals(
+                EffectiveTitleFrameRatePolicy(u144, false)) ||
+            mojorecomp::host::CommandProcessorTimeSignals(
+                TitlePolicyForNativeCadenceContent(u144, true)))
             return Fail("unlocked mode changed the 60 Hz progress-hook contract");
         if (!SamePolicy(TitlePolicyForNativeCadenceContent(u144, true),
                         PolicyFor(FrameRateMode::Compatibility30)))

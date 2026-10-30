@@ -26,6 +26,7 @@
 #include "../host/frame_rate_policy.h"
 #include "../host/pipeline_metrics.h"
 #include "../host/timing.h"
+#include "pipeline_policy.h"
 #include "pm4.h"
 #include "renderer_probe.h"
 
@@ -43,6 +44,7 @@ std::mutex g_graphicsInterruptMutex;
 std::mutex g_graphicsPumpWakeMutex;
 std::condition_variable g_graphicsPumpWakeCv;
 std::atomic<uint64_t> g_graphicsPumpWakeGeneration{0};
+mojorecomp::host::WakeableTimedWait g_graphicsPumpWaiter;
 
 constexpr uint32_t kCpRbWptrAddress = 0x7FC80714u;
 constexpr uint32_t kDisplayControllerGate = 0x7FC86544u;
@@ -80,16 +82,34 @@ uint64_t KernelSystemTime100ns()
     return kWindowsToUnixEpoch100ns + unix100ns;
 }
 
+// Phase 3 (docs/HFR-PHASE3.md section 4): in the HFR modes the pump's idle
+// poll uses a high-resolution timer, and the guest's CP poll, deferred stores
+// and the guest vblank wake it. condition_variable::wait_for rounds 250 us up
+// to a whole millisecond on Windows and then to the process timer tick.
+bool PromptPumpWaitActive()
+{
+    return mojorecomp::gpu::PromptPm4WakeRequested() &&
+           mojorecomp::gpu::HfrPipelinePolicyActive();
+}
+
 void PumpIdleWait()
 {
     // Sleep while the ring is idle, but let an interrupt handshake wake the CP
     // immediately instead of paying the full polling timeout.
     const auto start = std::chrono::steady_clock::now();
-    const uint64_t observed = g_graphicsPumpWakeGeneration.load(std::memory_order_acquire);
-    std::unique_lock<std::mutex> lock(g_graphicsPumpWakeMutex);
-    const bool woken = g_graphicsPumpWakeCv.wait_for(lock, std::chrono::microseconds(250), [&] {
-        return g_graphicsPumpWakeGeneration.load(std::memory_order_acquire) != observed;
-    });
+    bool woken = false;
+    if (PromptPumpWaitActive())
+    {
+        woken = g_graphicsPumpWaiter.Wait(std::chrono::microseconds(250));
+    }
+    else
+    {
+        const uint64_t observed = g_graphicsPumpWakeGeneration.load(std::memory_order_acquire);
+        std::unique_lock<std::mutex> lock(g_graphicsPumpWakeMutex);
+        woken = g_graphicsPumpWakeCv.wait_for(lock, std::chrono::microseconds(250), [&] {
+            return g_graphicsPumpWakeGeneration.load(std::memory_order_acquire) != observed;
+        });
+    }
     // A timed-out wait shows how long "250 us" really lasts on this host.
     if (!woken)
         mojorecomp::host::NotePm4PumpTimeout(static_cast<uint64_t>(
@@ -101,6 +121,10 @@ void WakeGraphicsProgressPump()
 {
     g_graphicsPumpWakeGeneration.fetch_add(1, std::memory_order_release);
     g_graphicsPumpWakeCv.notify_one();
+    // In the HFR modes both waits are signalled, so Bink starting or ending
+    // between them cannot lose a wake. The 30 FPS mode never uses the event.
+    if (mojorecomp::gpu::PromptPm4WakeRequested() && mojorecomp::gpu::HfrModeRequested())
+        g_graphicsPumpWaiter.Wake();
 }
 
 uint32_t RingBacklogDwords(uint32_t writePtr, uint32_t readPtr, uint32_t ringDwords)
@@ -290,6 +314,9 @@ void GraphicsVblankPump()
                 Pm4_IncrementCounter();
                 mojorecomp::host::NoteGuestVblank();
                 DeliverGraphicsInterrupt(threadContext, 0);
+                // The vblank ISR may have released a PM4 WAIT_REG_MEM.
+                if (PromptPumpWaitActive())
+                    WakeGraphicsProgressPump();
                 perfVblankIsrNs += static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - isrStart).count());

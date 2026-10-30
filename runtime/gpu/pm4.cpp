@@ -202,7 +202,7 @@ void ProfilePacketOpcode(uint32_t opcode, uint32_t dwords)
 }
 
 void (*g_interruptSink)() = nullptr;
-void (*g_interruptCommandSink)() = nullptr;
+bool (*g_interruptCommandSink)() = nullptr;
 void (*g_interruptWakeSink)() = nullptr;
 void (*g_shaderSink)(uint32_t, uint64_t, const uint8_t*, uint32_t) = nullptr;
 void (*g_registerSink)(uint32_t, uint32_t) = nullptr;
@@ -1103,9 +1103,9 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                      static_cast<unsigned long long>(g_frames),
                      static_cast<unsigned long long>(g_draws),
                      depth);
-            if (g_interruptCommandSink)
-                g_interruptCommandSink();
-            else if (g_interruptSink)
+            // The command sink returns false when the interrupt may take effect
+            // right here, at CP time (docs/HFR-PHASE3.md section 3).
+            if (!(g_interruptCommandSink && g_interruptCommandSink()) && g_interruptSink)
                 g_interruptSink();
             break;
         }
@@ -1337,7 +1337,7 @@ void Pm4_SetInterruptSink(void (*sink)())
     g_interruptSink = sink;
 }
 
-void Pm4_SetInterruptCommandSink(void (*sink)())
+void Pm4_SetInterruptCommandSink(bool (*sink)())
 {
     g_interruptCommandSink = sink;
 }

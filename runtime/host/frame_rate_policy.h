@@ -390,6 +390,18 @@ constexpr bool TitlePresentImmediate(FrameRatePolicy policy) noexcept
            policy.requiresTitlePatches;
 }
 
+// Phase 3 (docs/HFR-PHASE3.md): GPU memory writes and command-processor
+// interrupts take effect when the PM4 thread reaches them (CP time), as on the
+// synchronous executor, instead of when the Vulkan thread does. The Vulkan
+// thread reads guest memory only through immutable per-draw snapshots, so no
+// guest-visible value changes, only when it appears. HFR modes only: the 30 FPS
+// mode and native-cadence video keep the ordering they were validated with.
+constexpr bool CommandProcessorTimeSignals(FrameRatePolicy policy) noexcept
+{
+    policy = HighFrameRate60TitleContract(policy);
+    return policy.mode == FrameRateMode::HighFrameRate60 && policy.requiresTitlePatches;
+}
+
 // One title-side async state machine spins inside a single update while its
 // worker reports status 4 (pending). On the original 30 FPS path that blocking
 // poll is part of the observed cadence. Once the outer scheduler is released at

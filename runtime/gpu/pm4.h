@@ -19,8 +19,11 @@ void Pm4_SetReadPointerSlot(uint32_t guestAddress);
 void Pm4_SetReadPointerUpdateFrequency(uint32_t dwords);
 
 // Called exactly where an INTERRUPT packet is reached in the command stream.
+// The command sink, when set, may defer the interrupt behind earlier renderer
+// work and returns true when it did; false delivers it through the interrupt
+// sink at this stream position (CP time).
 void Pm4_SetInterruptSink(void (*sink)());
-void Pm4_SetInterruptCommandSink(void (*sink)());
+void Pm4_SetInterruptCommandSink(bool (*sink)());
 void Pm4_SetInterruptWakeSink(void (*sink)());
 void Pm4_NotifyWorkAvailable();
 void Pm4_RendererInterruptHandshake();

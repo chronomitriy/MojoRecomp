@@ -525,6 +525,18 @@ bool OrderedGpuCommandStream::Flush()
     return !sequence || executor_->Wait(sequence);
 }
 
+bool OrderedGpuCommandStream::WaitFor(GpuSequence sequence)
+{
+    if (!executor_ || !sequence)
+        return true;
+    return executor_->CompletedSequence() >= sequence || executor_->Wait(sequence);
+}
+
+GpuSequence OrderedGpuCommandStream::CompletedSequence() const noexcept
+{
+    return executor_ ? executor_->CompletedSequence() : 0;
+}
+
 GpuExecutorStats OrderedGpuCommandStream::Stats() const noexcept
 {
     return executor_ ? executor_->Stats() : GpuExecutorStats{};

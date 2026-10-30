@@ -245,6 +245,10 @@ public:
     void ApplyPendingStores(GuestMemorySnapshot& snapshot,
                             const PendingGuestStores& stores) const;
     bool Flush();
+    // Waits until one earlier command has completed, servicing renderer
+    // handshakes meanwhile like Flush. Returns false on failure or shutdown.
+    bool WaitFor(GpuSequence sequence);
+    GpuSequence CompletedSequence() const noexcept;
     GpuExecutorStats Stats() const noexcept;
     bool Shutdown();
 

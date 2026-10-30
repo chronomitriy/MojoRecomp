@@ -128,7 +128,7 @@ if(BUILD_TESTING)
         cpu/ppc_constant_scan.cpp)
     add_test(NAME PpcConstantScan COMMAND MojoRecompPpcConstantScanTest)
     set_tests_properties(PpcConstantScan PROPERTIES TIMEOUT 10 LABELS "cpu;timing")
-    add_executable(MojoRecompTimingTest tests/timing_test.cpp)
+    add_executable(MojoRecompTimingTest tests/timing_test.cpp host/timing.cpp)
     add_test(NAME HostTiming COMMAND MojoRecompTimingTest)
     set_tests_properties(HostTiming PROPERTIES TIMEOUT 10 LABELS "host;timing")
     add_executable(MojoRecompPresentationMetricsTest
@@ -161,6 +161,18 @@ if(BUILD_TESTING)
     add_test(NAME DebugOverlay COMMAND MojoRecompDebugOverlayTest)
     add_executable(MojoRecompInputMergeTest tests/input_merge_test.cpp)
     add_test(NAME InputMerge COMMAND MojoRecompInputMergeTest)
+    add_executable(MojoRecompSwapHandshakeTest
+        tests/swap_handshake_test.cpp
+        gpu/pm4.cpp
+        gpu/gpu_executor.cpp
+        gpu/guest_memory_snapshot.cpp
+        host/pipeline_metrics.cpp
+        host/timing.cpp)
+    if(WIN32)
+        target_link_libraries(MojoRecompSwapHandshakeTest PRIVATE onecore)
+    endif()
+    add_test(NAME SwapHandshake COMMAND MojoRecompSwapHandshakeTest)
+    set_tests_properties(SwapHandshake PROPERTIES TIMEOUT 120 LABELS "gpu;timing;performance")
     add_executable(MojoRecompPm4ExtentProbe tests/pm4_extent_probe.cpp gpu/pm4.cpp
         host/pipeline_metrics.cpp)
     add_test(NAME Pm4ExtentProbe COMMAND MojoRecompPm4ExtentProbe)

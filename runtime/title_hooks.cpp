@@ -15,6 +15,7 @@
 
 #include "runtime_state.h"
 #include "cpu/guest_fiber.h"
+#include "gpu/pipeline_policy.h"
 #include "gpu/pm4.h"
 #include "host/frame_rate_policy.h"
 #include "host/pipeline_metrics.h"
@@ -317,6 +318,7 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
         uint32_t observed = 0;
         std::chrono::steady_clock::time_point start{};
         std::chrono::steady_clock::time_point last{};
+        std::chrono::steady_clock::time_point lastWake{};
         uint64_t byPm4Activity[mojorecomp::host::kPm4ActivityCount]{};
         uint64_t polls = 0;
     };
@@ -360,6 +362,14 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
             attribute(now);
             cpWait.last = now;
             ++cpWait.polls;
+        }
+        // Phase 3: the guest is blocked on the PM4 thread, so do not leave the
+        // pump asleep until its next poll timeout. Repeat every 50 us in case
+        // the pump went back to sleep without reaching the guest's pointer.
+        if (waitingOnCp && hfrCooperativePoll && mojorecomp::gpu::PromptPm4WakeRequested() &&
+            (cpWait.polls == 1 || now - cpWait.lastWake >= std::chrono::microseconds(50))) {
+            cpWait.lastWake = now;
+            Pm4_NotifyWorkAvailable();
         }
     }
 

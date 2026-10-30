@@ -14,9 +14,11 @@
 #include "../config/runtime_config.h"
 #include "../kernel/klog.h"
 #include "pm4.h"
+#include "cp_time_signals.h"
 #include "draw_snapshot.h"
 #include "gpu_executor.h"
 #include "guest_memory_snapshot.h"
+#include "pipeline_policy.h"
 #include "shader_cache.h"
 #include "vk_presenter.h"
 #include "xenos.h"
@@ -42,6 +44,10 @@ bool g_asyncExecutorEnabled = false;
 mojorecomp::host::PipelineCounters g_previousPipelineCounters{};
 bool g_havePreviousPipelineCounters = false;
 constexpr uint64_t kPipelineSummaryFrames = 120;
+// PM4 thread only: GPU stores and interrupts left to the Vulkan thread, and the
+// presents it has not completed yet.
+mojorecomp::gpu::CpTimeSignalGate g_cpTimeSignalGate;
+mojorecomp::gpu::PresentLagBound g_presentLag;
 
 bool EnvEnabled(const char* name)
 {
@@ -76,20 +82,53 @@ void OnRegisterBatch(const uint32_t* indices, const uint32_t* values, std::size_
         g_gpuCommandStream->WriteRegisters(indices, values, count);
 }
 
+// CP-time signals (docs/HFR-PHASE3.md section 3). Every value a GPU store
+// writes is computed by the PM4 thread from the packet, its registers or the CP
+// counter, and the Vulkan thread reads guest memory only through the immutable
+// snapshot each draw captured on the PM4 thread. So a store or interrupt can
+// take effect where the PM4 thread meets it, as on the synchronous executor:
+// nothing the Vulkan thread still has to do can observe the guest's reaction.
+// A CP-time signal must never overtake one already left to the Vulkan thread,
+// so the switch waits until every deferred signal has completed.
+bool CpTimeSignalsActive()
+{
+    if (!g_asyncExecutorEnabled || !g_gpuCommandStream)
+        return false;
+    return g_cpTimeSignalGate.Allow(mojorecomp::gpu::CpTimeSignalsRequested() &&
+                                        mojorecomp::gpu::HfrPipelinePolicyActive(),
+                                    g_gpuCommandStream->CompletedSequence());
+}
+
+void StoreGuestNow(uint8_t* base, uint32_t guestAddress, uint32_t value)
+{
+    if (!base)
+        return;
+    auto* destination = reinterpret_cast<volatile uint32_t*>(base + guestAddress);
+    *destination = __builtin_bswap32(value);
+}
+
 void OnStore(uint8_t* base, uint32_t guestAddress, uint32_t value)
 {
     if (!g_gpuCommandStream)
     {
-        if (base)
-        {
-            auto* destination = reinterpret_cast<volatile uint32_t*>(base + guestAddress);
-            *destination = __builtin_bswap32(value);
-        }
+        StoreGuestNow(base, guestAddress, value);
+        return;
+    }
+    if (CpTimeSignalsActive())
+    {
+        StoreGuestNow(base, guestAddress, value);
+        mojorecomp::host::NoteGpuSignal(true);
         return;
     }
     const auto sequence = g_gpuCommandStream->Enqueue(mojorecomp::gpu::GuestStoreCommand{
         base, guestAddress, value});
-    if (!sequence)
+    if (sequence)
+    {
+        g_cpTimeSignalGate.NoteQueued(sequence);
+        if (g_asyncExecutorEnabled)
+            mojorecomp::host::NoteGpuSignal(false);
+    }
+    else
     {
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true))
@@ -109,21 +148,71 @@ void OnRenderBarrier()
     }
 }
 
-void OnInterruptCommand()
+// Returns false when PM4 should deliver the interrupt itself, at CP time.
+bool OnInterruptCommand()
 {
     if (!g_gpuCommandStream)
-        return;
+        return true;
+    if (CpTimeSignalsActive())
+    {
+        mojorecomp::host::NoteGpuSignal(true);
+        return false;
+    }
 
     // The worker-side handshake delivers the ISR at this exact FIFO position.
     // The PM4 producer must remain free to service that handshake rather than
     // synchronously waiting for the worker that is waiting on the producer.
     const auto sequence = g_gpuCommandStream->Enqueue(
         mojorecomp::gpu::InterruptCommand{});
-    if (!sequence)
+    if (sequence)
+    {
+        g_cpTimeSignalGate.NoteQueued(sequence);
+        mojorecomp::host::NoteGpuSignal(false);
+    }
+    else
     {
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true))
             KLOG("gpu-probe: ordered renderer interrupt failed\n");
+    }
+    return true;
+}
+
+// With CP-time signals the swap no longer waits for the Vulkan thread, so bound
+// how far ahead the PM4 thread (and with it the guest) may run: after it
+// enqueues a present, at most MOJORECOMP_PM4_FRAMES_AHEAD presents may still be
+// outstanding. Without CP-time signals the swap handshake already drains the
+// Vulkan thread every frame, and only the count is recorded.
+void TrackPresent(mojorecomp::gpu::GpuSequence sequence)
+{
+    if (!g_gpuCommandStream || !g_asyncExecutorEnabled)
+        return;
+    mojorecomp::host::NoteOutstandingPresents(static_cast<uint32_t>(
+        g_presentLag.Retire(g_gpuCommandStream->CompletedSequence())));
+    g_presentLag.Add(sequence);
+    if (!sequence || !CpTimeSignalsActive())
+        return;
+
+    const size_t limit = mojorecomp::gpu::Pm4FramesAhead();
+    while (const auto oldest = g_presentLag.MustWaitFor(limit))
+    {
+        if (g_gpuCommandStream->CompletedSequence() < oldest)
+        {
+            const uint64_t backpressureBefore = g_gpuCommandStream->Stats().backpressureNs;
+            const auto start = std::chrono::steady_clock::now();
+            const auto previous =
+                mojorecomp::host::SetPm4Activity(mojorecomp::host::Pm4Activity::FrameLag);
+            g_gpuCommandStream->WaitFor(oldest);
+            mojorecomp::host::SetPm4Activity(previous);
+            const uint64_t waitedNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count());
+            const uint64_t backpressureNs =
+                g_gpuCommandStream->Stats().backpressureNs - backpressureBefore;
+            mojorecomp::host::NotePm4FrameLagWait(
+                waitedNs > backpressureNs ? waitedNs - backpressureNs : 0);
+        }
+        g_presentLag.PopOldest();
     }
 }
 
@@ -278,6 +367,7 @@ void OnSwap(uint8_t*, uint32_t frontBuffer, uint32_t width, uint32_t height)
             KLOG("gpu-probe: Vulkan output resize failed for %ux%u\n",
                  outputWidth, outputHeight);
     }
+    mojorecomp::gpu::GpuSequence presentSequence = 0;
     if (VkPresenter_Active() && !outputMinimized)
     {
         const auto sequence = g_gpuCommandStream
@@ -290,7 +380,9 @@ void OnSwap(uint8_t*, uint32_t frontBuffer, uint32_t width, uint32_t height)
             if (!reported.exchange(true))
                 KLOG("gpu-probe: Vulkan present failed; PM4 execution continues\n");
         }
+        presentSequence = sequence;
     }
+    TrackPresent(presentSequence);
 
     const uint64_t number = ++g_swaps;
     mojorecomp::gpu::GuestSnapshotAdvanceEpoch();
@@ -410,6 +502,11 @@ void RendererProbe_Init()
                 auto* destination = reinterpret_cast<volatile uint32_t*>(
                     command.guestBase + command.guestAddress);
                 *destination = __builtin_bswap32(command.value);
+                // A PM4 WAIT_REG_MEM may be polling this value; let the pump
+                // re-poll now instead of at its next timeout.
+                if (mojorecomp::gpu::PromptPm4WakeRequested() &&
+                    mojorecomp::gpu::HfrPipelinePolicyActive())
+                    Pm4_NotifyWorkAvailable();
                 return true;
             };
             backend.producerService = [] {
