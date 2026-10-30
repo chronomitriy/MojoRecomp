@@ -124,7 +124,7 @@ That is cheap for static meshes and textures. It is very expensive for data the 
   - Run `tools\recompile.bat` and `build-smoke.bat`, then play.
   - `cr_as_local`, `non_argument_as_local` and `non_volatile_as_local` are riskier: they depend on the context-switch analysis.
   - Expect crashes or subtle logic bugs if the analysis misses a path. Revert the lines if anything is off.
-  - **Phase 2:** the low-risk step is committed as experimental, and the riskier options were analysed ([HFR-PHASE2 5](HFR-PHASE2.md#5-guest-cpu-register-localization)).
+  - **Phase 2:** the low-risk step is committed as experimental, and the riskier options were analysed ([HFR-PHASE2 5](HFR-PHASE2.md#5-guest-cpu)).
 - **Every indirect (virtual) call records a crash breadcrumb.** `tools/recompile.py:79` routes calls through `MojoRecompTraceIndirectCall`, which writes a thread-local record and checks a guarded static (`kernel/imports.cpp:73`). That is cheap per call, but virtual calls are frequent in this engine.
 
 ### 2.6 Are late frames quantized to vblank ticks?

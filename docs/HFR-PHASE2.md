@@ -16,7 +16,7 @@ so the reasoning can be checked against your own `ppc\` output.
 2. [Method](#2-method)
 3. [The scheduler floor (E2)](#3-the-scheduler-floor-e2)
 4. [The 40/20 FPS plateaus](#4-the-4020-fps-plateaus)
-5. [Guest CPU: register localization](#5-guest-cpu-register-localization)
+5. [Guest CPU](#5-guest-cpu)
 6. [PM4/snapshot thread: command memory](#6-pm4snapshot-thread-command-memory)
 7. [Test on Windows](#7-test-on-windows)
 8. [What was and was not verified](#8-what-was-and-was-not-verified)
@@ -31,7 +31,7 @@ so the reasoning can be checked against your own `ppc\` output.
 | 2 | **The plateaus come from D3D's vsync handshake.** In HFR the title asks for present interval ONE whenever exactly one vblank has passed. D3D then holds the command processor on a scratch register until the vblank interrupt flips, and the `XE_SWAP` that presents the frame comes after that wait. The PM4 thread and the host present therefore stop until the next 60 Hz guest vblank. | `MojoRecompHfrPresentImmediate` at `0x8238F060` keeps the immediate interval in HFR. | High that the wait exists and the hook removes it. Medium-high that it is what quantizes your FPS: confirm with `vblankReleased` and FPS. |
 | 3 | `ctr`/`xer`/`reserved` localization is safe by ABI and by a control-flow liveness check over all 19,806 generated functions. `cr` and non-volatile localization also pass the checks, but change far more code. | **Experimental:** `ctr_as_local`, `xer_as_local`, `reserved_as_local` = true. | Medium: compiles, checked statically, never run. |
 | 4 | Pure3D's immediate-mode primitives (via D3D `BeginVertices`) and D3D's resolve and clear rectangles keep their vertices **inside the command buffer**. Each such draw write-protected a command page that the next lap of the buffer rewrites, costing a guest write fault. | Command memory is never write-protected; small captures from it are copied fresh. Hot pages stay opt-in. | High for the mechanism. Unmeasured how many faults per frame it removes: read `faults=` and `cmd=`. |
-| 5 | Stretch goal (native replacements of hot guest functions): not started in this pass. | — | — |
+| 5 | Stretch: the title's libc `memset` and a second forward copy ran as translated PPC loops; `memcpy` was already native but copied overlapping ranges differently from the title. | Native `memset` and forward copy; all three hooks now fall back to the translated original wherever a host copy could differ, verified by a differential test against the originals. Game-specific hot loops (skinning, culling, collision) need a profile first ([5.5](#55-finding-the-hot-guest-functions)). | High for correctness (differential test). The FPS gain depends on how much the title copies and fills; unmeasured. |
 
 What to try first on your PC: the 60 mode with these commits, the same route as your
 28-minute session. Compare `Vulkan perf` FPS, `[pipeline] vblankReleased` and
@@ -285,7 +285,7 @@ jump_address_on_true = 0x8238F078
 - If FPS still plateaus with `vblankReleased` near 0, the remaining limit is CPU time:
   `guest cpu` close to the frame time.
 
-## 5. Guest CPU: register localization
+## 5. Guest CPU
 
 ### 5.1 What was run
 
@@ -350,6 +350,87 @@ was a `PPCContext` load after each call and is now the constant 0. Carry chains 
   and play a long session before C.
 - **Do not use D.** `non_argument_as_local` is not gated by the analysis and breaks the
   funclets and save helpers that receive `r11`/`r12` from their caller.
+- The analysis treats a mid-asm hook as host code. With the libc hooks of 5.4, B localizes
+  7,188 functions instead of 7,199 and C 8,114 instead of 8,168.
+
+### 5.4 Native libc routines
+
+`runtime/guest_native.cpp` replaces three of the title's libc routines with host code, as
+mid-asm hooks at their entry points:
+
+| Routine | Callers | Translated loop | Before | Now |
+| --- | --- | --- | --- | --- |
+| `memcpy` `0x823CEC90` | 464 | 8-byte and 128-byte block copy | Native; overlapping ranges copied byte by byte | Native unless the ranges overlap |
+| forward copy `0x823CF0E8` | 21 | Word copy with an unaligned-source path | Translated | Native unless the ranges overlap |
+| `memset` `0x823CF440` | 129 | 16-byte store loop | Translated | Native |
+
+- Each hook now returns `bool` (`return_on_true`), so the translated original stays in the
+  image. A hook declines, and the original runs, whenever a flat host copy could differ:
+  - overlapping ranges, also through the three physical alias views;
+  - a range that crosses into or between the views;
+  - a range that leaves the 32-bit guest space.
+- The 0.2.0 `memcpy` hook handled overlap with a byte-by-byte forward copy. The title's own
+  routine copies 8 bytes at a time, so the results differ, for example with
+  `dst = src + 4`. Overlapping `memcpy` is undefined in C and probably rare in this title;
+  either way, it now gets the title's exact behaviour.
+- `MOJORECOMP_NATIVE_GUEST_CRT=0` turns all three off.
+- Test: `MojoRecompGuestNativeTest` links the translated image without the host runtime.
+  `tools/gen_guest_test_stubs.py` generates aborting stubs for every import and every other
+  hook. For 3,000 generated cases per routine it runs the translated original and the
+  native path on the same memory and checks that:
+  - memory and `r3` are identical;
+  - the original itself equals `memcpy`/`memset` where that is defined;
+  - the native path really took the non-overlapping cases.
+
+  The cases cover sizes 0–73 KiB, misalignment, overlap at 1/4/8/128-byte distances, and
+  `r4` with garbage in its high bits. It also checks that alias, view-crossing and wrapping
+  ranges are refused without touching memory. It passes on Linux and as a MinGW build under
+  Wine. Removing the overlap guard, corrupting the fill byte, or restoring the old byte-wise
+  overlap copy each make it fail.
+- `--bench` on the cloud Xeon (2.1 GHz). The harness rebuilds a `PPCContext` per call,
+  about 20 ns:
+
+  | Routine | 512 B | 4 KiB | 64 KiB |
+  | --- | --- | --- | --- |
+  | forward copy, aligned | 148 → 29 ns | 1,116 → 50 ns | 18.9 → 1.2 µs |
+  | forward copy, misaligned | 295 → 30 ns | 2,225 → 50 ns | 28.8 → 1.3 µs |
+  | `memset`, aligned | 55 → 26 ns | 300 → 46 ns | 4.2 → 1.4 µs |
+  | `memset`, misaligned | 56 → 25 ns | 279 → 55 ns | 4.6 → 1.3 µs |
+
+  Below 128 bytes the two paths are equal. How much this gains in a frame depends on how
+  many large fills and copies the title does, which only a profile shows.
+
+### 5.5 Finding the hot guest functions
+
+Skinning, culling and collision code could not be ranked without running the game. In
+the image, the dense vector loops sit in library code just before the Bink section
+(`0x8240xxxx`), and the long scalar float loops in game code at `0x8234xxxx`–`0x8235xxxx`.
+Neither is evidence of cost. The build already produces `cot-runtime.pdb`, in which every
+translated function is named `sub_<guest address>`, so a sampling profile names the guest
+functions directly:
+
+1. Start the game with `tools\run-custom-runtime.bat` and reach the slow scene.
+2. In an administrator `cmd` window:
+
+   ```bat
+   wpr -start CPU -filemode
+   ```
+
+3. Play about 30 seconds, then:
+
+   ```bat
+   wpr -stop "%USERPROFILE%\Desktop\cot-cpu.etl"
+   ```
+
+4. Open the trace in Windows Performance Analyzer (Microsoft Store or Windows ADK), add
+   `runtime\build-smoke` to the symbol path, then open CPU Usage (Sampled) and group by
+   Process, Thread, Function. The guest main thread's top `sub_8xxxxxxx` entries are the
+   candidates. AMD uProf, which is free, gives the same view on your Ryzen.
+
+For each candidate: add a `bool` hook in `guest_native.cpp` with `return_on_true`, add the
+routine and an input generator to `kRoutines` in `tests/guest_native_test.cpp`, and keep it
+only if the differential test passes. A routine that reads constants from the image needs
+the image loaded into the test's guest memory first; the current three do not.
 
 ## 6. PM4/snapshot thread: command memory
 
@@ -445,7 +526,7 @@ is not reachable from `hfr-unlimited`, so pushing that branch never sends it.
 
 ### 7.2 Rebuild
 
-The config changed (two hooks and the localization flags), so the translated code must be
+The config changed (new hooks and the localization flags), so the translated code must be
 regenerated. If you have never built from source, or `setup.bat` stopped with "MojoRecomp
 Xenon runtime patch conflicts with this checkout", run it first; the patch fix in this
 branch makes it pass.
@@ -470,11 +551,15 @@ Same configure command as in [HFR-UNLIMITED.md 4.6](HFR-UNLIMITED.md#46-optional
 Then:
 
 ```bat
-"C:\Program Files\CMake\bin\cmake.exe" --build runtime\build-tests --target MojoRecompFrameRatePolicyTest MojoRecompPipelineMetricsTest MojoRecompGuestMemorySnapshotTest MojoRecompGuestMemorySnapshotHotPagesTest MojoRecompGuestMemorySnapshotCommandMemoryTest MojoRecompPm4ExtentProbe MojoRecompSnapshotFaultBenchmark
+"C:\Program Files\CMake\bin\cmake.exe" --build runtime\build-tests --target MojoRecompFrameRatePolicyTest MojoRecompPipelineMetricsTest MojoRecompGuestMemorySnapshotTest MojoRecompGuestMemorySnapshotHotPagesTest MojoRecompGuestMemorySnapshotCommandMemoryTest MojoRecompPm4ExtentProbe MojoRecompGuestNativeTest MojoRecompSnapshotFaultBenchmark
 ```
 
 ```bat
-"C:\Program Files\CMake\bin\ctest.exe" --test-dir runtime\build-tests -R "FrameRatePolicy|PipelineMetrics|GuestMemorySnapshot|Pm4ExtentProbe" --output-on-failure
+"C:\Program Files\CMake\bin\ctest.exe" --test-dir runtime\build-tests -R "FrameRatePolicy|PipelineMetrics|GuestMemorySnapshot|Pm4ExtentProbe|GuestNative" --output-on-failure
+```
+
+```bat
+runtime\build-tests\MojoRecompGuestNativeTest.exe --bench
 ```
 
 ```bat
@@ -521,6 +606,7 @@ Set one variable per run in the `cmd` window, then start the game as in 7.4:
 | The plateau fix | `set MOJORECOMP_HFR_GUEST_VSYNC=1` |
 | The command-memory snapshot change | `set MOJORECOMP_SNAPSHOT_COMMAND_MEMORY=0` |
 | Hot pages on top | `set MOJORECOMP_SNAPSHOT_HOT_PAGES=1` |
+| The native libc routines | `set MOJORECOMP_NATIVE_GUEST_CRT=0` |
 
 Register localization cannot be toggled at run time. To isolate it, set the three
 `*_as_local` lines in `config\CrashOfTheTitans.toml` back to `false`, then run
@@ -579,8 +665,14 @@ names only `f13`. The committed block also passes `f0`, which only feeds the his
   DialogueCatalog, RcfDiagnostics. FrameRatePolicy also passes with Clang 18.
 - Wine 9 (MinGW GCC build), all passing: GuestMemorySnapshot, GuestMemorySnapshotHotPages,
   GuestMemorySnapshotCommandMemory, Pm4ExtentProbe.
-- Mutation checks: the 80% floor fails the new `Game::Tick` test, and disabling the
-  command-memory policy fails its test.
+- Linux (Clang 18) and Wine 9 (MinGW build), linking the full translated image:
+  `MojoRecompGuestNativeTest`, the differential test of the three libc hooks against the
+  translated originals.
+- Mutation checks that make the tests fail:
+  - the 80% floor (`Game::Tick` test);
+  - the command-memory policy turned off;
+  - the libc hooks without the overlap guard, with a wrong fill byte, or with the old
+    byte-wise overlap copy.
 - The static analyses in sections 3–6 (disassembly, generated C++, liveness scripts).
 
 **Not done:**
@@ -591,7 +683,8 @@ names only `f13`. The committed block also passes `f0`, which only feeds the his
   for 7.4.
 - dt-correctness of the game below 1/60 s is untested; there was no audit of every
   frame-count-based system.
-- How many write faults the snapshot change removes per frame is unknown.
+- How many write faults the snapshot change removes per frame is unknown, as is how much
+  frame time the native libc routines save.
 - No gameplay, audio or visual validation.
 
 ## 9. Environment variables
@@ -602,6 +695,7 @@ New in this phase (the phase 1 list is in [HFR-UNLIMITED.md 8](HFR-UNLIMITED.md#
 | --- | --- |
 | `MOJORECOMP_HFR_GUEST_VSYNC=1` | Keep the title's own present interval in the HFR modes (undoes the plateau fix, for A/B runs) |
 | `MOJORECOMP_SNAPSHOT_COMMAND_MEMORY=0` | Write-protect command memory again (phase 1 behaviour) |
+| `MOJORECOMP_NATIVE_GUEST_CRT=0` | Run the translated `memcpy`, forward copy and `memset` only |
 
 ## 10. Commits
 
@@ -616,3 +710,5 @@ All on `hfr-phase2`, in order, none touching `game\` or `ppc\`:
 | `tools: summarize the [pipeline] fields and [hfr] notices` | Summarizer |
 | `patches: restore exact context whitespace in the Xenon runtime patch` | Build fix for `setup.bat` (independent of HFR) |
 | `docs: phase 2 findings and test plan` | This file and pointers in HFR-UNLIMITED.md |
+| `runtime, config: native libc memset and forward copy, tested against the originals` | Section 5.4, harness, differential test |
+| `docs: native libc routines and profiling` | Sections 5.4 and 5.5 |
