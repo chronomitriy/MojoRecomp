@@ -19823,9 +19823,14 @@ switch_table_file_path = "CrashOfTheTitans_switch_tables.toml"
 # enter host/indirect code or the guest scheduler context switch.
 skip_lr = false
 skip_msr = false
-ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
+# EXPERIMENTAL (docs/HFR-PHASE2.md): CTR, XER and the lwarx reservation are
+# volatile across calls in the Xenon ABI, so they become C++ locals here. A
+# control-flow liveness check over every generated function found none that
+# reads them before writing them; only the exception-unwind context restore
+# loses its mtctr/mtxer. If anything regresses, set these three back to false.
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
 cr_as_local = false
 non_argument_as_local = false
 non_volatile_as_local = false
