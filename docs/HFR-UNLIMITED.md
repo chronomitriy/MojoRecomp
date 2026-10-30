@@ -7,6 +7,12 @@ release. All work was done without the game: code was read, compiled and
 unit-tested in a cloud container. Nothing was run against Crash of the Titans.
 [Section 6](#6-what-was-and-was-not-verified) lists exactly what was and was not verified.
 
+> **Phase 2 update.** [HFR-PHASE2.md](HFR-PHASE2.md) was written with the game's executable.
+> It locates and hooks the scheduler floor, explains and fixes the 40/20 FPS plateaus,
+> enables part of the register localization experimentally and stops write-protecting
+> command memory. Where this file says something can only be found with the game, the
+> answer is now there; statements it corrects are marked "Phase 2:".
+
 ## Contents
 
 1. [Summary](#1-summary)
@@ -26,7 +32,7 @@ unit-tested in a cloud container. Nothing was run against Crash of the Titans.
 | Which stage limits your 37 FPS scenes? | **Not known from 0.2.0 logs.** "guest+PM4 26.65 ms" is the whole frame interval minus present time, not guest time. `tools\summarize-runtime-log.bat` works out the Vulkan thread's share from your **existing** log. The new `[pipeline]` line names the busiest stage directly. [2.2](#22-reading-your-020-numbers) |
 | Per-draw CPU cost | **Fixed:** two linear shader-module searches, one linear pipeline search and one Win32 key-state syscall on every draw. Lookups dropped from 1.1–7.5 µs to 0.06 µs per draw in a cloud microbenchmark. **Opt-in:** hot-page snapshots, against write-protection fault storms. [2.3](#23-per-draw-cost-what-changed) [2.4](#24-snapshot-write-protection) |
 | Does the HFR gate quantize late frames to 2–3 vblank ticks? | **No.** A unit test runs the real gate with 25 ms updates: each one is released at exactly 25 ms. The 40/20 FPS plateaus must come from another wait; the new counters identify which. [2.6](#26-are-late-frames-quantized-to-vblank-ticks) |
-| Can the game run above 60 at correct speed? | **Only after one title-specific address is found on your PC.** The title's own scheduler refuses steps shorter than 1/60 s. The new 120/144/165/uncapped modes therefore stay at exactly 60 until a hook lowers that floor. `MOJORECOMP_HFR_DISCOVERY=1` locates it and prints the config block to add. [3](#3-phase-2-above-60-fps) |
+| Can the game run above 60 at correct speed? | **Phase 2: the address is found and hooked** ([HFR-PHASE2 3](HFR-PHASE2.md#3-the-scheduler-floor-e2)). Original answer: **only after one title-specific address is found on your PC.** The title's own scheduler refuses steps shorter than 1/60 s. The new 120/144/165/uncapped modes therefore stay at exactly 60 until a hook lowers that floor. `MOJORECOMP_HFR_DISCOVERY=1` locates it and prints the config block to add. [3](#3-phase-2-above-60-fps) |
 | Install Runtime from ZIP? | **Not possible for a self-built runtime.** The launcher only accepts ZIPs signed with the official release key (`launcher/src-tauri/src/updates.rs:882`). Use `tools\run-custom-runtime.bat` instead. [4.5](#45-run-the-custom-runtime) |
 
 Priority order for your PC:
@@ -109,6 +115,7 @@ That is cheap for static meshes and textures. It is very expensive for data the 
   - A cached range is only ever served while all its pages are protected, so stale bytes cannot be returned.
   - Tested under Wine in `guest_memory_snapshot_hot_pages_test.cpp`.
   - It is off by default until it is measured on real hardware.
+- **Phase 2:** command memory (Pure3D's immediate-mode vertices and D3D's resolve rectangles live there) is no longer write-protected at all, by default ([HFR-PHASE2 6](HFR-PHASE2.md#6-pm4snapshot-thread-command-memory)).
 
 ### 2.5 Guest-side candidates (documented, not changed)
 
@@ -117,6 +124,7 @@ That is cheap for static meshes and textures. It is very expensive for data the 
   - Run `tools\recompile.bat` and `build-smoke.bat`, then play.
   - `cr_as_local`, `non_argument_as_local` and `non_volatile_as_local` are riskier: they depend on the context-switch analysis.
   - Expect crashes or subtle logic bugs if the analysis misses a path. Revert the lines if anything is off.
+  - **Phase 2:** the low-risk step is committed as experimental, and the riskier options were analysed ([HFR-PHASE2 5](HFR-PHASE2.md#5-guest-cpu-register-localization)).
 - **Every indirect (virtual) call records a crash breadcrumb.** `tools/recompile.py:79` routes calls through `MojoRecompTraceIndirectCall`, which writes a thread-local record and checks a guarded static (`kernel/imports.cpp:73`). That is cheap per call, but virtual calls are frequent in this engine.
 
 ### 2.6 Are late frames quantized to vblank ticks?
@@ -131,7 +139,7 @@ The HFR60 gate does not quantize. If an update finishes late, the next gate chec
 
 The host side already presents as soon as a frame is ready: VSync off selects `IMMEDIATE`/`MAILBOX` (`vk_presenter.cpp:2263`). So 40/20 FPS plateaus would have to come from a **guest or PM4 wait tied to the 60 Hz vblank**. Candidates:
 
-- a `WAIT_REG_MEM` on memory that the vblank ISR writes (a flip or "display done" flag);
+- a `WAIT_REG_MEM` on memory that the vblank ISR writes (a flip or "display done" flag). **Phase 2: this one**, D3D's present handshake with interval ONE ([HFR-PHASE2 4](HFR-PHASE2.md#4-the-4020-fps-plateaus));
 - a guest event or fence signalled by the vblank ISR;
 - the mode-1 progress path's reconciliation block.
 
@@ -170,7 +178,7 @@ The guest's own timing was established by the original port and is encoded in co
 
 | # | Fact | Source |
 | --- | --- | --- |
-| E1 | The title loop measures elapsed µs in `r28` and dispatches its update only when `r28 > 33333`. HFR60 doubles `r28` right before that compare. | `config/CrashOfTheTitans.toml:19887-19895` |
+| E1 | The title loop measures elapsed µs in `r28` and dispatches its update only when `r28 > 33333`. HFR60 doubles `r28` right before that compare. **Phase 2:** that gate only runs on loading and transition screens; gameplay calls `Game::Tick` every pass ([HFR-PHASE2 3.1](HFR-PHASE2.md#31-the-title-loop)). | `config/CrashOfTheTitans.toml:19887-19895` |
 | E2 | "The downstream scheduler already uses a **1/60-second minimum** and receives the unmodified real delta in f1." | same, `:19888-19889`; `frame_rate_policy.h` |
 | E3 | The mode-1 progress synchronizer paces frames by the 60 Hz graphics-interrupt counter. Its look-ahead turns that into 30 Hz; HFR cancels the look-ahead and the vblank wait. | `:19897-19915` |
 | E4 | "Crash consumes source-0 as an engine progress tick". A 1 ms vblank made the game run about twice as fast. | `gpu/vd.cpp:125-128` |
@@ -201,7 +209,7 @@ Unlike the Twinsanity decompilation, there is no source code here. A timing fix 
 - **Settings.** The launcher offers `120`, `144`, `165` and `uncapped`. The runtime also accepts any integer from 61 to 300 when run directly; for example, `162` keeps a 165 Hz G-Sync display inside its VRR range. `uncapped` uses a 300 Hz safety ceiling, so menus or loading screens can never hand the update a near-zero step. The launcher passes an unlocked choice as `MOJORECOMP_FRAME_RATE=60` plus `MOJORECOMP_FRAME_RATE_TARGET=<rate>`. A runtime that predates these modes therefore runs its 60 mode instead of falling back to 30.
 - **30 and 60 are unchanged.** `tests/frame_rate_policy_test.cpp` carries a verbatim copy of the 0.2.0 policy. It compares every 30/60 result over 200,000 gate values and a million-step phased sequence, plus all the other hooks.
 - **Gate.** It releases at exactly the target period on the guest's fixed `r28 > 33333` comparison. A pure scale lands on the wrong side at some rates: 144 Hz gives 6944 × 144 / 30 = 33331. The 60 Hz phase rules are kept: carry the sub-period overshoot, drop it after a whole missed period.
-- **Floor.** 80% of the target period: 6.667 ms at 120 Hz, 5.556 ms at 144, 4.848 ms at 165. A step released by the gate is never refused or clamped up by a floor that sits on the period itself. Whichever form E2 takes (skip, accumulate or clamp), the game speed stays correct.
+- **Floor.** 80% of the target period: 6.667 ms at 120 Hz, 5.556 ms at 144, 4.848 ms at 165. A step released by the gate is never refused or clamped up by a floor that sits on the period itself. Whichever form E2 takes (skip, accumulate or clamp), the game speed stays correct. **Phase 2:** E2 is an accumulator with no outer gate on the gameplay path, so the floor is now exactly the target period ([HFR-PHASE2 3.4](HFR-PHASE2.md#34-the-change)).
 - **Unchanged above 60:**
   - the progress, vblank-wait, async-poll and GPU-poll hooks keep the 60 Hz contract;
   - the guest vblank stays 60 Hz (E4);
@@ -220,6 +228,8 @@ These could not be checked without the binary. Going from 30 to 60 already exerc
 - **CPU load doubles.** At 2x resolution your CPU is not reaching 60 yet, so finish phase 1 first.
 
 ### 3.5 Finding the floor on your PC
+
+**Phase 2:** found statically; the hook is in `config/CrashOfTheTitans.toml` (`0x821FC1C8`). The steps below remain useful as a cross-check ([HFR-PHASE2 7.7](HFR-PHASE2.md#77-optional-cross-check-with-the-discovery-tool)).
 
 1. Run once with discovery enabled, in the 60 mode, from a level start (see [4.8](#48-unlocking-above-60)). The log gets:
    - `[hfr-discovery] scanned … KiB of guest code: N loads of 1/60, M loads of 60.0`, followed by up to 64 `image 1/60` loads with their function addresses;
@@ -378,6 +388,8 @@ For the benchmark, use the `pipelines=` and `modules=` counts from your `Vulkan 
 
 ### 4.8 Unlocking above 60
 
+**Phase 2:** steps 1 and 2 are no longer needed; the floor hook is committed. Follow [HFR-PHASE2 7.6](HFR-PHASE2.md#76-run-2-above-60).
+
 1. Run discovery from a level start. Play 20–30 seconds of gameplay, then quit.
 
    ```bat
@@ -498,3 +510,5 @@ Compare every item against the 60 FPS mode on the same save. The fastest objecti
 | `MOJORECOMP_WAIT_PROFILE=1` | Guest kernel waits by caller (existing) |
 | `MOJORECOMP_CP_TIME_PROFILE=1` | `graphics CP perf` once a second (existing) |
 | `MOJORECOMP_DETAILED_CPU_PROFILE=0` | Turns off the per-draw profiler timers and the `Vulkan CPU profile` line (existing) |
+
+Phase 2 adds `MOJORECOMP_HFR_GUEST_VSYNC` and `MOJORECOMP_SNAPSHOT_COMMAND_MEMORY` ([HFR-PHASE2 9](HFR-PHASE2.md#9-environment-variables)).
