@@ -83,6 +83,9 @@ struct GpuExecutorBackend
     // Used to service renderer-originated handshakes without allowing a
     // full-queue W<->D deadlock.
     std::function<void()> producerService;
+    // Producer thread only: true when it starts waiting for queue space,
+    // false when it stops. Diagnostics; it must not submit work.
+    std::function<void(bool)> producerBlocked;
 };
 
 struct GpuExecutorStats

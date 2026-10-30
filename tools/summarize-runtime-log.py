@@ -50,6 +50,22 @@ PIPELINE_FIELDS = {
     "snap faults": re.compile(r"faults=([\d.]+)"),
     "snap protects": re.compile(r"protects=([\d.]+)"),
 }
+# Phase 3 wait breakdown (docs/HFR-PHASE3.md section 2).
+PIPELINE_FIELDS.update({
+    "polls/frame": re.compile(r" polls=([\d.]+)"),
+    "frameLag ms": re.compile(r" lag=([\d.]+)ms/"),
+    "idleWait ms": re.compile(r"idleWait=([\d.]+)ms"),
+    "ring avg KiB": re.compile(r"ring avg=([\d.]+)KiB"),
+    "ring max KiB": re.compile(r"ring avg=[\d.]+KiB max=([\d.]+)KiB"),
+    "signals cpTime": re.compile(r"signals cpTime=([\d.]+)"),
+    "signals deferred": re.compile(r"signals cpTime=[\d.]+ deferred=([\d.]+)"),
+    "inflight": re.compile(r"inflight=([\d.]+)"),
+})
+# Bracketed groups of name=ms values: cpWait by PM4 activity, stall by reason.
+GROUP_RES = {
+    "cpWait/pm4": re.compile(r"cpBy\[([^\]]*)\]"),
+    "pm4 stall/": re.compile(r"stallBy\[([^\]]*)\]"),
+}
 TICKS_RE = re.compile(r"gate releases=(?P<releases>\d+) ticks: (?P<ticks>.*)$")
 HFR_RE = re.compile(r"\[hfr\] (?P<text>(scheduler floor lifted|present interval|unlocked rate|"
                     r"MojoRecompHfrSchedulerFloor saw).*)$")
@@ -68,6 +84,36 @@ def describe(values: list[float]) -> str:
             f"p90 {percentile(values, 0.9):6.2f}")
 
 
+def median_of(windows: list[dict[str, float]], name: str) -> float | None:
+    values = [w[name] for w in windows if name in w]
+    return statistics.median(values) if values else None
+
+
+def report_window_class(windows: list[dict[str, float]], title: str, keep,
+                        group_names: list[str]) -> None:
+    """Medians over one class of [pipeline] windows, and which wait dominates."""
+    chosen = [w for w in windows if keep(w["fps"])]
+    if not chosen:
+        return
+    print(f"\n  {title}: {len(chosen)} windows, medians per frame")
+    for name in ["guest cpu ms", "cpWait ms", "pm4 busy ms", "pm4 stall ms", "vblankReleased",
+                 "vulkan worker ms", "backpressure ms", "frameLag ms", "idleWait ms",
+                 "ring avg KiB", "inflight", "signals cpTime", "signals deferred",
+                 *group_names]:
+        value = median_of(chosen, name)
+        if value is not None:
+            print(f"    {name:<20} {value:7.2f}")
+    # Name the largest share of the guest's wait and of the PM4 thread's stall.
+    for group in GROUP_RES:
+        parts = {name[len(group):-3].strip(): median_of(chosen, name)
+                 for name in group_names if name.startswith(group)}
+        parts = {k: v for k, v in parts.items() if v is not None}
+        if parts and sum(parts.values()) > 0.05:
+            top = max(parts, key=parts.get)
+            print(f"    => {group.rstrip('/')}: mostly '{top}' ({parts[top]:.2f} of "
+                  f"{sum(parts.values()):.2f} ms per frame)")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__.strip())
@@ -77,6 +123,7 @@ def main(argv: list[str]) -> int:
 
     perf, cpu, probes, pipeline = [], [], [], []
     fields: dict[str, list[float]] = {name: [] for name in PIPELINE_FIELDS}
+    windows: list[dict[str, float]] = []
     ticks: Counter = Counter()
     hfr_notes: list[str] = []
     health = None
@@ -92,9 +139,18 @@ def main(argv: list[str]) -> int:
             health = (int(m["pipelines"]), int(m["modules"]))
         elif m := PIPELINE_RE.search(line):
             pipeline.append((float(m["fps"]), float(m["frame"]), m["busiest"], int(m["share"])))
+            window = {"fps": float(m["fps"])}
             for name, field_re in PIPELINE_FIELDS.items():
                 if f := field_re.search(line):
                     fields[name].append(float(f.group(1)))
+                    window[name] = float(f.group(1))
+            for group, group_re in GROUP_RES.items():
+                if g := group_re.search(line):
+                    for item in g.group(1).split():
+                        key, _, value = item.partition("=")
+                        window[f"{group}{'' if group.endswith('/') else ' '}{key} ms"] = \
+                            float(value)
+            windows.append(window)
             if t := TICKS_RE.search(line):
                 releases = int(t["releases"])
                 for bucket in t["ticks"].split():
@@ -175,11 +231,20 @@ def main(argv: list[str]) -> int:
         print("  per frame:")
         for name, values in fields.items():
             if values:
-                print(f"    {name:<16} {describe(values)}")
+                print(f"    {name:<20} {describe(values)}")
+        group_names = list(dict.fromkeys(key for w in windows for key in w
+                                         if any(key.startswith(g) for g in GROUP_RES)))
+        for name in group_names:
+            values = [w[name] for w in windows if name in w]
+            print(f"    {name:<20} {describe(values)}")
         total_ticks = sum(ticks.values())
         if total_ticks:
             print("  title update intervals (16.667 ms ticks): " + "  ".join(
                 f"{name}:{100 * n / total_ticks:.0f}%" for name, n in ticks.items()))
+        report_window_class(windows, "slow windows (fps < 50)", lambda fps: fps < 50.0,
+                            group_names)
+        report_window_class(windows, "full-rate windows (fps >= 55)", lambda fps: fps >= 55.0,
+                            group_names)
     if hfr_notes:
         print("\n[hfr] lines:")
         for note in hfr_notes:

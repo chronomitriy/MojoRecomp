@@ -309,36 +309,59 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
     const bool waitingOnCp = !(statusFlags & 0x2u) && currentPtrSlot && currentPtr == observedPtr;
 
     // Account the wall time this thread spends waiting for the PM4 thread to
-    // advance the CP read pointer. Clock reads happen only while waiting.
+    // advance the CP read pointer, split by what the PM4 thread was doing at
+    // each poll. Clock reads happen only while waiting.
     struct CpWaitEpisode {
         bool active = false;
         uint32_t object = 0;
         uint32_t observed = 0;
         std::chrono::steady_clock::time_point start{};
         std::chrono::steady_clock::time_point last{};
+        uint64_t byPm4Activity[mojorecomp::host::kPm4ActivityCount]{};
+        uint64_t polls = 0;
     };
     static thread_local CpWaitEpisode cpWait;
+    const bool hfrCooperativePoll =
+        mojorecomp::host::TitleGpuPollCooperative(ActiveTitleFrameRatePolicy());
     if (waitingOnCp || cpWait.active) {
         const auto now = std::chrono::steady_clock::now();
         const bool sameEpisode = cpWait.active && cpWait.object == object &&
                                  cpWait.observed == observedPtr;
+        auto attribute = [&](std::chrono::steady_clock::time_point until) {
+            const uint32_t activity =
+                static_cast<uint32_t>(mojorecomp::host::CurrentPm4Activity());
+            if (activity < mojorecomp::host::kPm4ActivityCount && until > cpWait.last)
+                cpWait.byPm4Activity[activity] += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        until - cpWait.last).count());
+        };
         if (cpWait.active && (!waitingOnCp || !sameEpisode)) {
             // The poll loop normally calls this hook once more after the
             // pointer moves. If it left another way, end at the last poll.
             const bool endsNow = !waitingOnCp &&
                                  now - cpWait.last < std::chrono::milliseconds(1);
             const auto end = endsNow ? now : cpWait.last;
+            if (endsNow)
+                attribute(now);
             mojorecomp::host::NoteGuestCpWait(static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - cpWait.start).count()));
+            mojorecomp::host::NoteGuestCpWaitBreakdown(cpWait.byPm4Activity, cpWait.polls);
             cpWait.active = false;
         }
-        if (waitingOnCp && !cpWait.active)
-            cpWait = {true, object, observedPtr, now, now};
-        else if (waitingOnCp)
+        if (waitingOnCp && !cpWait.active) {
+            cpWait = {};
+            cpWait.active = true;
+            cpWait.object = object;
+            cpWait.observed = observedPtr;
+            cpWait.start = now;
             cpWait.last = now;
+            cpWait.polls = 1;
+        } else if (waitingOnCp) {
+            attribute(now);
+            cpWait.last = now;
+            ++cpWait.polls;
+        }
     }
-    const bool hfrCooperativePoll =
-        mojorecomp::host::TitleGpuPollCooperative(ActiveTitleFrameRatePolicy());
 
     // Xenon's db16cyc backoff becomes a no-op in the recompilation. In HFR,
     // restore that short CPU pause only while the CP pointer is unchanged. A

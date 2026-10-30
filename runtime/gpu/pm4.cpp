@@ -267,8 +267,20 @@ struct WaitStallTiming
     uint32_t packetVa = 0;
     std::chrono::steady_clock::time_point start{};
     uint64_t vblankAtLastFail = 0;
+    mojorecomp::host::Pm4StallReason target = mojorecomp::host::Pm4StallReason::Other;
 };
 WaitStallTiming g_waitStallTiming;
+
+// Addresses recently written by GPU stores (PM4 thread only), so a
+// WAIT_REG_MEM on a fence can be told apart from one on CPU-written memory.
+// Direct-mapped: a collision only loses the classification, never a store.
+constexpr uint32_t kGpuWrittenSlots = 1024;
+std::array<uint32_t, kGpuWrittenSlots> g_gpuWrittenAddresses{};
+
+uint32_t GpuWrittenSlot(uint32_t va)
+{
+    return (va >> 2) & (kGpuWrittenSlots - 1u);
+}
 
 inline uint32_t GuestLoad32(const uint8_t* base, uint32_t address)
 {
@@ -309,6 +321,7 @@ bool StoreGpuRaw(uint8_t* base, uint32_t physicalAddress, uint32_t value)
     const uint32_t va = PhysicalToCached(physicalAddress & ~3u);
     if (va < kPhysicalBase || uint64_t(va) + 4 > kPhysicalEnd)
         return false;
+    g_gpuWrittenAddresses[GpuWrittenSlot(va)] = va;
     if (g_storeSink)
         g_storeSink(base, va, value);
     else
@@ -325,6 +338,37 @@ void StoreGpu(uint8_t* base, uint32_t addressDword, uint32_t value,
 }
 
 bool EvalWaitCondition(uint32_t info, uint32_t value, uint32_t mask, uint32_t ref);
+
+// What a stalled WAIT_REG_MEM polls: a scratch-register write-back slot (the
+// D3D swap and CPU-callback handshake), other memory a GPU store wrote
+// (fences), or anything else (registers, CPU-written memory).
+mojorecomp::host::Pm4StallReason ClassifyWaitTarget(uint32_t info, uint32_t poll)
+{
+    using mojorecomp::host::Pm4StallReason;
+    if (!(info & 0x10u))
+        return Pm4StallReason::Other;
+    const uint32_t va = PhysicalToCached(poll & ~3u);
+    const uint32_t umask = g_registers[kScratchUmsk] & 0xFFu;
+    const uint32_t scratchBase = PhysicalToCached(g_registers[kScratchAddr] & ~3u);
+    if (umask && va >= scratchBase && va - scratchBase < 8u * 4u &&
+        (umask & (1u << ((va - scratchBase) / 4u))))
+        return Pm4StallReason::SwapHandshake;
+    if (g_gpuWrittenAddresses[GpuWrittenSlot(va)] == va)
+        return Pm4StallReason::GpuWrittenMemory;
+    return Pm4StallReason::Other;
+}
+
+mojorecomp::host::Pm4Activity StallActivity(mojorecomp::host::Pm4StallReason target)
+{
+    using mojorecomp::host::Pm4Activity;
+    using mojorecomp::host::Pm4StallReason;
+    switch (target)
+    {
+        case Pm4StallReason::SwapHandshake: return Pm4Activity::StallSwap;
+        case Pm4StallReason::GpuWrittenMemory: return Pm4Activity::StallGpu;
+        default: return Pm4Activity::StallOther;
+    }
+}
 
 uint32_t LoadGpu(const uint8_t* base, uint32_t addressDword)
 {
@@ -947,6 +991,7 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                         timing.active = true;
                         timing.packetVa = waitPacketVa;
                         timing.start = std::chrono::steady_clock::now();
+                        timing.target = ClassifyWaitTarget(info, poll);
                     }
                     timing.vblankAtLastFail = mojorecomp::host::GuestVblankSequence();
                     const uint64_t n = ++g_waitStalls;
@@ -972,7 +1017,9 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - g_waitStallTiming.start).count()),
                         mojorecomp::host::GuestVblankSequence() !=
-                            g_waitStallTiming.vblankAtLastFail);
+                            g_waitStallTiming.vblankAtLastFail,
+                        g_waitStallTiming.target);
+                    mojorecomp::host::SetPm4Activity(mojorecomp::host::Pm4Activity::Parsing);
                 }
             }
             break;
@@ -1453,6 +1500,23 @@ uint32_t Pm4_Execute(uint8_t* base, uint32_t writePtr)
     const uint32_t ringDwords = g_ringDwords.load(std::memory_order_relaxed);
     if (!ringBase || !ringDwords)
         return writePtr;
+
+    // A stall episode keeps its state between polls; anything else is either
+    // parsing now or idle once this call returns.
+    struct ActivityScope
+    {
+        ActivityScope()
+        {
+            if (!g_waitStallTiming.active)
+                mojorecomp::host::SetPm4Activity(mojorecomp::host::Pm4Activity::Parsing);
+        }
+        ~ActivityScope()
+        {
+            mojorecomp::host::SetPm4Activity(
+                g_waitStallTiming.active ? StallActivity(g_waitStallTiming.target)
+                                         : mojorecomp::host::Pm4Activity::Idle);
+        }
+    } activityScope;
     static uint32_t notedRingBase = 0;
     if (g_commandMemorySink && notedRingBase != ringBase)
     {

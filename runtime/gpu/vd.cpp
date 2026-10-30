@@ -84,17 +84,32 @@ void PumpIdleWait()
 {
     // Sleep while the ring is idle, but let an interrupt handshake wake the CP
     // immediately instead of paying the full polling timeout.
+    const auto start = std::chrono::steady_clock::now();
     const uint64_t observed = g_graphicsPumpWakeGeneration.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> lock(g_graphicsPumpWakeMutex);
-    g_graphicsPumpWakeCv.wait_for(lock, std::chrono::microseconds(250), [&] {
+    const bool woken = g_graphicsPumpWakeCv.wait_for(lock, std::chrono::microseconds(250), [&] {
         return g_graphicsPumpWakeGeneration.load(std::memory_order_acquire) != observed;
     });
+    // A timed-out wait shows how long "250 us" really lasts on this host.
+    if (!woken)
+        mojorecomp::host::NotePm4PumpTimeout(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count()));
 }
 
 void WakeGraphicsProgressPump()
 {
     g_graphicsPumpWakeGeneration.fetch_add(1, std::memory_order_release);
     g_graphicsPumpWakeCv.notify_one();
+}
+
+uint32_t RingBacklogDwords(uint32_t writePtr, uint32_t readPtr, uint32_t ringDwords)
+{
+    if (!ringDwords)
+        return 0;
+    const uint32_t write = writePtr % ringDwords;
+    const uint32_t read = readPtr % ringDwords;
+    return write >= read ? write - read : write + ringDwords - read;
 }
 
 bool CpTimeProfileEnabled()
@@ -366,10 +381,15 @@ void GraphicsProgressPump()
             const uint32_t wptr =
                 *reinterpret_cast<be<uint32_t>*>(g_guestMemory.Translate(kCpRbWptrAddress));
             Pm4_SetReadPointerSlot(rptrSlot);
+            const uint32_t ringDwordsNow = ringSize / 4u;
+            mojorecomp::host::NoteRingBacklog(
+                RingBacklogDwords(wptr, before, ringDwordsNow), ringDwordsNow);
             const auto pm4Start = periodicDiagnostics
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
             const uint32_t consumed = Pm4_Execute(g_guestMemory.base, wptr);
+            mojorecomp::host::NoteRingBacklog(
+                RingBacklogDwords(wptr, consumed, ringDwordsNow), ringDwordsNow);
             if (periodicDiagnostics)
             {
                 perfPm4Ns += static_cast<uint64_t>(

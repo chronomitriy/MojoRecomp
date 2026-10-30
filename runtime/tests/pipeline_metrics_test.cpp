@@ -51,6 +51,32 @@ int main()
     NoteGuestCpWait(2'000'000);
     NotePm4Stall(1'000'000, true);
     NotePm4Stall(500'000, false);
+    // Phase 3: a swap-handshake stall that a vblank happened to end counts as
+    // vblank; the others keep the class of the memory they polled.
+    NotePm4Stall(8'000'000, false, Pm4StallReason::SwapHandshake);
+    NotePm4Stall(2'000'000, true, Pm4StallReason::SwapHandshake);
+    NotePm4Stall(400'000, false, Pm4StallReason::GpuWrittenMemory);
+    uint64_t byActivity[kPm4ActivityCount]{};
+    byActivity[static_cast<uint32_t>(Pm4Activity::StallSwap)] = 3'000'000;
+    byActivity[static_cast<uint32_t>(Pm4Activity::Parsing)] = 1'000'000;
+    NoteGuestCpWaitBreakdown(byActivity, 4000);
+    NotePm4FrameLagWait(2'000'000);
+    NotePm4FrameLagWait(2'000'000);
+    NotePm4PumpTimeout(1'000'000);
+    NotePm4PumpTimeout(15'000'000);
+    NoteRingBacklog(1024, 16384);
+    NoteRingBacklog(0, 16384);
+    for (int i = 0; i < 6; ++i)
+        NoteGpuSignal(true);
+    NoteGpuSignal(false);
+    NoteOutstandingPresents(1);
+    NoteOutstandingPresents(1);
+    NoteOutstandingPresents(0);
+    NoteOutstandingPresents(1);
+    if (SetPm4Activity(Pm4Activity::Backpressure) != Pm4Activity::Idle ||
+        CurrentPm4Activity() != Pm4Activity::Backpressure ||
+        SetPm4Activity(Pm4Activity::Idle) != Pm4Activity::Backpressure)
+        return Fail("PM4 activity is not a restorable single state");
     const uint64_t vblank = GuestVblankSequence();
     NoteGuestVblank();
     if (GuestVblankSequence() != vblank + 1)
@@ -75,12 +101,18 @@ int main()
     current.snapshotCommandCaptures = 20;
 
     const std::string line = FormatPipelineSummary(previous, current);
+    // Totals per 4 frames: stall 1.0+0.5+8.0+2.0+0.4 = 11.9 ms in 5 episodes,
+    // two of them released by a vblank; 4 ms of frame-lag waits come off pm4 busy.
     const char* expected[] = {
         "[pipeline] frames=4 fps=40.00 frame=25.00ms busiest=guest(90%)",
         "guest cpu=22.50ms(90%) cpWait=1.00ms/0.5x",
-        "pm4 busy=9.00ms sink=5.00ms backpressure=1.00ms stall=0.38ms/0.5x vblankReleased=0.2x",
+        "pm4 busy=8.00ms sink=5.00ms backpressure=1.00ms stall=2.98ms/1.2x vblankReleased=0.5x",
         "vulkan worker=12.00ms",
         "snap hit=90.0% miss=25.0 volatile=3.0 cmd=5.0 copied=1.00MiB faults=10.0 protects=2.0",
+        "| waits cpBy[idle=0.00 parse=0.25 swap=0.75 gpu=0.00 other=0.00 bp=0.00 lag=0.00] "
+        "polls=1000 stallBy[swap=2.00 gpu=0.10 vblank=0.75 other=0.12] lag=1.00ms/0.5x "
+        "idleWait=8.000ms/0.5x ring avg=",
+        " max=4.0KiB of 64KiB signals cpTime=1.5 deferred=0.2 inflight=0.75 | ",
         "gate releases=4 ticks: <1=0% 1=75% 1.5=0% 2=25% 2.5=0% 3=0% >3=0%",
     };
     for (const char* needle : expected)
@@ -93,6 +125,13 @@ int main()
     const std::string hostOnly = FormatPipelineSummary(previous, current);
     if (!Contains(hostOnly, "busiest=vulkan(48%)") || !Contains(hostOnly, "guest cpu=n/a"))
         return Fail("host-only summary picked the wrong stage", hostOnly);
+
+    // The ring maximum restarts with every sample; totals do not.
+    PipelineCounters next{};
+    ReadPipelineCounters(next);
+    if (next.ringBacklogMaxDwords != 0 || next.ringDwords != 16384 ||
+        next.cpTimeSignals != current.cpTimeSignals)
+        return Fail("ring maximum is not per window or a total was reset");
 
     std::puts("PASS: pipeline counters name the busiest stage and vblank-tick quantization.");
     return 0;

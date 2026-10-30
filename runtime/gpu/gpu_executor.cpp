@@ -261,6 +261,10 @@ bool AsynchronousGpuExecutor::FlushPendingBatch()
 
     const auto waitStart = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(mutex_);
+    const bool blocked = accepting_.load(std::memory_order_acquire) &&
+                         queue_.size() >= queueCapacity_;
+    if (blocked && backend_.producerBlocked)
+        backend_.producerBlocked(true);
     while (accepting_.load(std::memory_order_acquire) &&
            queue_.size() >= queueCapacity_)
     {
@@ -272,6 +276,8 @@ bool AsynchronousGpuExecutor::FlushPendingBatch()
             lock.lock();
         }
     }
+    if (blocked && backend_.producerBlocked)
+        backend_.producerBlocked(false);
     const auto waitEnd = std::chrono::steady_clock::now();
     if (!accepting_.load(std::memory_order_acquire))
         return false;

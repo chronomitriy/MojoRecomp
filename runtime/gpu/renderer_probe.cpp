@@ -415,6 +415,15 @@ void RendererProbe_Init()
             backend.producerService = [] {
                 Pm4_ServiceRendererInterrupts();
             };
+            backend.producerBlocked = [](bool blocked) {
+                static mojorecomp::host::Pm4Activity saved =
+                    mojorecomp::host::Pm4Activity::Parsing;
+                if (blocked)
+                    saved = mojorecomp::host::SetPm4Activity(
+                        mojorecomp::host::Pm4Activity::Backpressure);
+                else
+                    mojorecomp::host::SetPm4Activity(saved);
+            };
             // The ordered asynchronous executor is the production path. Keep
             // a zero-valued environment override as an emergency/debug rollback
             // to the old synchronous submission model.
