@@ -16,7 +16,10 @@ rem     game overlay only for a Localization Pack profile; same as the launcher
 rem
 rem Extra MOJORECOMP_* variables set before running (for example
 rem MOJORECOMP_HFR_DISCOVERY=1 or MOJORECOMP_SNAPSHOT_HOT_PAGES=1) are passed
-rem through. The runtime log is written to the launcher's log folder.
+rem through. The runtime log is written to the launcher's log folder. Options the
+rem launcher has no field for (docs\HFR-PHASE4.md): MOJORECOMP_MOTION_BLUR=0,
+rem MOJORECOMP_UPSCALER=fsr1 or rcas, MOJORECOMP_FSR_SHARPNESS=0..1,
+rem MOJORECOMP_GUEST_PROFILE=1 or all, and MOJORECOMP_GPU_PROFILE=1.
 
 set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
@@ -77,6 +80,8 @@ if errorlevel 1 exit /b 1
 >> "%RUNTIME_LOG%" echo runtime=%RUNTIME%
 >> "%RUNTIME_LOG%" echo game_root=%GAME_ROOT%
 >> "%RUNTIME_LOG%" echo frame_rate=%FRAME_RATE%
+rem Empty means unset: settings.toml, custom-settings.toml or the default applies.
+>> "%RUNTIME_LOG%" echo env motion_blur=%MOJORECOMP_MOTION_BLUR% upscaler=%MOJORECOMP_UPSCALER% fsr_sharpness=%MOJORECOMP_FSR_SHARPNESS% guest_profile=%MOJORECOMP_GUEST_PROFILE% gpu_profile=%MOJORECOMP_GPU_PROFILE%
 >> "%RUNTIME_LOG%" echo --- runtime output ---
 
 echo Starting the self-built runtime at frame rate %FRAME_RATE%.

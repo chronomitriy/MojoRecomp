@@ -10,6 +10,10 @@ of XenonRecomp's translated C++, plus Linux and Wine tests.
 No game data is part of these commits. Guest addresses and a few instructions are quoted
 so the reasoning can be checked against your own `ppc\` output.
 
+> **Later phases.** [HFR-PHASE3.md](HFR-PHASE3.md) decouples the swap handshake;
+> [HFR-PHASE4.md](HFR-PHASE4.md) adds a motion blur toggle, FSR 1 and the GPU and guest
+> CPU profilers.
+
 ## Contents
 
 1. [Summary](#1-summary)

@@ -38,9 +38,11 @@ def implemented_imports() -> set[str]:
     for path in sorted(RUNTIME.rglob("*.cpp")):
         if path.resolve() == OUT.resolve():
             continue
-        # Build trees may contain generated copies and compiler probes. They are
-        # not source-of-truth runtime implementations.
-        if "build-smoke" in path.parts or "build" in path.parts:
+        # Build trees (runtime/build and runtime/build-*, ignored by Git) may
+        # contain generated copies, test stubs for every import and compiler
+        # probes. They are not source-of-truth runtime implementations.
+        parts = path.relative_to(RUNTIME).parts
+        if any(part == "build" or part.startswith("build-") for part in parts):
             continue
         source = path.read_text(encoding="utf-8", errors="replace")
         for pattern in DEFINITION_PATTERNS:

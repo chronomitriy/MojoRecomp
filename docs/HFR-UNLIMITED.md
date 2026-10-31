@@ -15,6 +15,9 @@ unit-tested in a cloud container. Nothing was run against Crash of the Titans.
 >
 > **Phase 3 update.** [HFR-PHASE3.md](HFR-PHASE3.md) removes the swap handshake's wait for
 > the Vulkan thread, wakes the PM4 pump promptly and speeds up the vertex path.
+>
+> **Phase 4 update.** [HFR-PHASE4.md](HFR-PHASE4.md) adds a motion blur toggle, FSR 1
+> upscaling/sharpening, and GPU and guest CPU profilers, all off by default.
 
 ## Contents
 

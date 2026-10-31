@@ -133,7 +133,9 @@ void Dispatch(PPCContext& ctx, uint8_t* base)
 } // namespace mojorecomp::guestcall
 
 // The profiler tag records the import and its guest call site (lr).
-#define GUEST_FUNCTION_HOOK(guest, host)                                                \
+// The second parameter is not named `host`: that would also replace the
+// namespace in mojorecomp::host below.
+#define GUEST_FUNCTION_HOOK(guest, hostFunction)                                        \
     PPC_FUNC(guest)                                                                     \
     {                                                                                   \
         KCALL(#guest);                                                                  \
@@ -141,7 +143,7 @@ void Dispatch(PPCContext& ctx, uint8_t* base)
             mojorecomp::host::ImportActivityFor(#guest);                                \
         const mojorecomp::host::GuestActivityScope guestProfileScope(                   \
             kGuestProfileActivity, #guest, static_cast<uint32_t>(ctx.lr));              \
-        mojorecomp::guestcall::Dispatch<host>(ctx, base);                                 \
+        mojorecomp::guestcall::Dispatch<hostFunction>(ctx, base);                       \
     }
 
 // Only use for calls where a no-op success is the faithful platform behavior.

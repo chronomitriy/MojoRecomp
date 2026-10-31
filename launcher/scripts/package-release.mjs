@@ -604,6 +604,7 @@ const launcherExe = resolve(productionRoot, "mojorecomp-launcher.exe");
 const projectLicense = resolve(projectRoot, "LICENSE");
 const licenseRoot = resolve(launcherRoot, "resources/licenses");
 const runtimeNoticeFiles = [
+  "AMD-FidelityFX-FSR1-LICENSE.txt",
   "DXC-LICENSE.txt",
   "DXC-ThirdPartyNotices.txt",
   "extract-xiso-LICENSE.TXT",

@@ -48,6 +48,15 @@ pipeline.
   span-search and subpixel implementation for the `FXAA` and `FXAA Extreme` modes.
 - Preserved notice: `resources/licenses/NVIDIA-FXAA-LICENSE.txt`.
 
+### AMD FidelityFX Super Resolution 1
+
+- Component: FSR 1 EASU upscaling and RCAS sharpening (`ffx_fsr1.h` v1.20210629 and the
+  helpers it uses from `ffx_a.h`, GPUOpen-Effects/FidelityFX-FSR commit `a21ffb8f`).
+- License: MIT.
+- Use in MojoRecomp: `runtime/gpu/fsr1.h` ports the 32-bit constant setup and shaders for
+  the optional `fsr1` and `rcas` presentation upscalers.
+- Preserved notice: `resources/licenses/AMD-FidelityFX-FSR1-LICENSE.txt`.
+
 ### SDL3
 
 - License: SDL's zlib-style license notice.

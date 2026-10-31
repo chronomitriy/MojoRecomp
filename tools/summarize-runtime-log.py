@@ -32,6 +32,22 @@ HEALTH_RE = re.compile(r"Vulkan raster health: .*?pipelines=(?P<pipelines>\d+) m
 PIPELINE_RE = re.compile(r"\[pipeline\] frames=\d+ fps=(?P<fps>[\d.]+) frame=(?P<frame>[\d.]+)ms "
                          r"busiest=(?P<busiest>\w+)\((?P<share>\d+)%\)")
 POLICY_RE = re.compile(r"frame policy simulation=(?P<sim>\d+)Hz presentation=(?P<pres>\d+)Hz")
+# Phase 4 (docs/HFR-PHASE4.md): effective options, shader replacement, FSR and profilers.
+GRAPHICS_RE = re.compile(r"cot-runtime: (?P<text>graphics resolution_scale=.*)$")
+PS_REPLACE_RE = re.compile(r"\[ps-replace\] (?P<text>.*)$")
+FSR_RE = re.compile(r"(?P<text>Vulkan FSR (active|shader compile failed): .*)$")
+GPU_PROFILE_RE = re.compile(r"\[gpu-profile\] frames=\d+ gpu=(?P<gpu>[\d.]+)ms "
+                            r"max=(?P<max>[\d.]+)ms \|(?P<categories>[^|]*)\| per frame: "
+                            r"(?P<counts>.*?) overflow=(?P<overflow>\d+) malformed=(?P<malformed>\d+)")
+GUEST_SUMMARY_RE = re.compile(r"\[guest-profile\] summary scope=(?P<scope>\w+) "
+                              r"thread=(?P<thread>\w+) seconds=(?P<seconds>[\d.]+) "
+                              r"samples=(?P<samples>\d+) rate=\d+/s (?P<kinds>.*)$")
+GUEST_ENTRY_RE = re.compile(r"\[guest-profile\] (?P<what>fn|bucket) scope=(?P<scope>\w+) "
+                            r"thread=(?P<thread>\w+) rank=(?P<rank>\d+) pct=(?P<pct>[\d.]+) "
+                            r"samples=\d+ name=(?P<name>\S+)")
+GUEST_CALLER_RE = re.compile(r"\[guest-profile\] caller scope=(?P<scope>\w+) "
+                             r"thread=(?P<thread>\w+) bucket=(?P<bucket>\S+) "
+                             r"pct=(?P<pct>[\d.]+) samples=\d+ name=(?P<name>\S+)")
 # Per-frame fields of the [pipeline] line (docs/HFR-UNLIMITED.md section 2.7).
 PIPELINE_FIELDS = {
     "guest cpu ms": re.compile(r"guest cpu=([\d.]+)ms"),
@@ -114,6 +130,66 @@ def report_window_class(windows: list[dict[str, float]], title: str, keep,
                   f"{sum(parts.values()):.2f} ms per frame)")
 
 
+def pairs(text: str) -> dict[str, float]:
+    """`a=1.5 b=2` -> {"a": 1.5, "b": 2.0}."""
+    result = {}
+    for item in text.split():
+        key, _, value = item.partition("=")
+        try:
+            result[key] = float(value)
+        except ValueError:
+            pass
+    return result
+
+
+def report_gpu_profile(windows: list[dict]) -> None:
+    print(f"\n{len(windows)} '[gpu-profile]' windows (MOJORECOMP_GPU_PROFILE=1), "
+          "medians per frame:")
+    total = statistics.median(w["gpu"] for w in windows)
+    worst = max(w["max"] for w in windows)
+    categories = list(dict.fromkeys(k for w in windows for k in w["categories"]))
+    medians = {k: statistics.median(w["categories"].get(k, 0.0) for w in windows)
+               for k in categories}
+    shown = "  ".join(f"{k}={v:.2f}" for k, v in sorted(medians.items(), key=lambda kv: -kv[1])
+                      if v >= 0.005)
+    print(f"  gpu-profile ms/frame: total={total:.2f} (worst frame {worst:.1f})  {shown}")
+    counts = list(dict.fromkeys(k for w in windows for k in w["counts"]))
+    print("  gpu-profile per frame: " + "  ".join(
+        f"{k}={statistics.median(w['counts'].get(k, 0.0) for w in windows):.1f}"
+        for k in counts))
+    overflow = sum(w["overflow"] for w in windows)
+    malformed = sum(w["malformed"] for w in windows)
+    if overflow or malformed:
+        print(f"  gpu-profile frames with dropped marks={overflow} unreadable={malformed}")
+
+
+def report_guest_profile(summaries: list[dict], entries: list[dict],
+                         callers: list[dict]) -> None:
+    # The whole-session report when the game was closed normally, otherwise the
+    # last 15-second window.
+    scope = "total" if any(s["scope"] == "total" for s in summaries) else "window"
+    for thread in dict.fromkeys(s["thread"] for s in summaries):
+        chosen = [s for s in summaries if s["scope"] == scope and s["thread"] == thread]
+        if not chosen:
+            continue
+        summary = chosen[-1]
+        # Entries belong to the last report of that scope and thread.
+        last = max(i for i, s in enumerate(summaries) if s is summary)
+        following = [s["index"] for s in summaries[last + 1:]]
+        end = following[0] if following else float("inf")
+        mine = [e for e in entries if summary["index"] < e["index"] < end]
+        mine_callers = [c for c in callers if summary["index"] < c["index"] < end]
+        kinds = "  ".join(f"{k}={v:.1f}%" for k, v in summary["kinds"].items() if v >= 0.05)
+        print(f"\nguest-profile {scope} thread={thread}: {summary['seconds']:.0f} s, "
+              f"{summary['samples']} samples: {kinds}")
+        for e in [e for e in mine if e["what"] == "fn"][:12]:
+            print(f"  guest-profile fn     {e['pct']:6.2f}%  {e['name']}")
+        for e in [e for e in mine if e["what"] == "bucket"][:8]:
+            top = [c for c in mine_callers if c["bucket"] == e["name"]][:2]
+            via = ("  from " + ", ".join(f"{c['name']} {c['pct']:.1f}%" for c in top)) if top else ""
+            print(f"  guest-profile bucket {e['pct']:6.2f}%  {e['name']}{via}")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__.strip())
@@ -128,8 +204,32 @@ def main(argv: list[str]) -> int:
     hfr_notes: list[str] = []
     health = None
     policy = None
-    for line in text:
-        if m := PERF_RE.search(line):
+    phase4_notes: list[str] = []
+    gpu_profile: list[dict] = []
+    guest_summaries: list[dict] = []
+    guest_entries: list[dict] = []
+    guest_callers: list[dict] = []
+    for index, line in enumerate(text):
+        if m := GUEST_ENTRY_RE.search(line):
+            guest_entries.append({"index": index, "what": m["what"], "pct": float(m["pct"]),
+                                  "name": m["name"]})
+        elif m := GUEST_CALLER_RE.search(line):
+            guest_callers.append({"index": index, "bucket": m["bucket"], "pct": float(m["pct"]),
+                                  "name": m["name"]})
+        elif m := GUEST_SUMMARY_RE.search(line):
+            guest_summaries.append({"index": index, "scope": m["scope"], "thread": m["thread"],
+                                    "seconds": float(m["seconds"]),
+                                    "samples": int(m["samples"]), "kinds": pairs(m["kinds"])})
+        elif m := GPU_PROFILE_RE.search(line):
+            gpu_profile.append({"gpu": float(m["gpu"]), "max": float(m["max"]),
+                                "categories": pairs(m["categories"]),
+                                "counts": pairs(m["counts"]),
+                                "overflow": int(m["overflow"]),
+                                "malformed": int(m["malformed"])})
+        elif m := (GRAPHICS_RE.search(line) or PS_REPLACE_RE.search(line) or FSR_RE.search(line)):
+            if m["text"] not in phase4_notes:
+                phase4_notes.append(m["text"])
+        elif m := PERF_RE.search(line):
             perf.append({k: float(v) for k, v in m.groupdict().items()})
         elif m := CPU_RE.search(line):
             cpu.append({k: float(v) for k, v in m.groupdict().items()})
@@ -165,6 +265,12 @@ def main(argv: list[str]) -> int:
     print(f"log: {path}")
     if policy:
         print(f"frame policy: simulation {policy[0]} Hz, presentation {policy[1]} Hz")
+    for note in phase4_notes:
+        print(f"  phase4: {note}")
+    if gpu_profile:
+        report_gpu_profile(gpu_profile)
+    if guest_summaries:
+        report_guest_profile(guest_summaries, guest_entries, guest_callers)
     if not perf:
         print("No 'Vulkan perf' lines: was logging enabled and did the game reach gameplay?")
         return 1

@@ -133,12 +133,27 @@ static void WriteProbeBmp(const std::filesystem::path& path, const uint8_t* pixe
     Require(bool(output), "write FXAA probe BMP");
 }
 
-static void CheckFxaaOrientation(const std::filesystem::path& capturePath)
+enum class PresentationProbe
 {
+    Fxaa,
+    // FXAA at the internal size, EASU to a larger output, then RCAS.
+    FsrEasu,
+    // Output not larger than the internal image: scaled crop, then RCAS only.
+    FsrRcasOnly,
+};
+
+static void CheckFxaaOrientation(const std::filesystem::path& capturePath,
+                                 PresentationProbe probe = PresentationProbe::Fxaa)
+{
+    const bool fsr = probe != PresentationProbe::Fxaa;
     mojorecomp::config::RuntimeConfig config{};
     config.antiAliasing = mojorecomp::config::AntiAliasing::Fxaa;
+    if (fsr)
+        config.upscaler = mojorecomp::config::Upscaler::Fsr1;
     mojorecomp::config::Set(config);
-    Require(HostWindow_Init(320, 180, true), "hidden FXAA window");
+    // The logical guest frame is 320x180; EASU needs a larger window.
+    const uint32_t windowScale = probe == PresentationProbe::FsrEasu ? 2u : 1u;
+    Require(HostWindow_Init(320 * windowScale, 180 * windowScale, true), "hidden FXAA window");
     Require(VkPresenter_Init(HostWindow_NativeHandle(), 320, 180), "FXAA presenter init");
     Require(BeginFrame(), "begin FXAA orientation frame");
     Require(SwitchActiveColorSurface(0, 0), "select FXAA source surface");
@@ -166,8 +181,21 @@ static void CheckFxaaOrientation(const std::filesystem::path& capturePath)
     g_images = {target.image};
     g_swapViews = {target.view};
     g_imageInitialized = {false};
-    Require(DrawFxaa(0, source->image, g_extent.width, g_extent.height),
-            "draw FXAA orientation frame");
+    if (fsr)
+    {
+        Require(DrawFsrPresentation(0, source->image, g_extent.width, g_extent.height, false),
+                "draw FSR orientation frame");
+        const bool easuUsed = g_fsrEasu.image != VK_NULL_HANDLE;
+        Require(easuUsed == (probe == PresentationProbe::FsrEasu),
+                "FSR must use EASU exactly when the output is larger than the crop");
+        Require(!easuUsed || (g_fsrEasu.extent.width == g_outputExtent.width &&
+                              g_fsrEasu.extent.height == g_outputExtent.height),
+                "EASU target must be the output size");
+        Require(g_fsrAa.image != VK_NULL_HANDLE, "FSR path must run FXAA first");
+    }
+    else
+        Require(DrawFxaa(0, source->image, g_extent.width, g_extent.height),
+                "draw FXAA orientation frame");
 
     VkImageMemoryBarrier toReadback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toReadback.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -181,8 +209,15 @@ static void CheckFxaaOrientation(const std::filesystem::path& capturePath)
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                            0, nullptr, 0, nullptr, 1, &toReadback);
 
+    // The presenter's readback area is sized for the internal image; an output
+    // larger than that (the EASU probe) is read back from the end of the
+    // upload arena instead, which this probe does not otherwise use.
+    const VkDeviceSize outputBytes =
+        VkDeviceSize(g_outputExtent.width) * g_outputExtent.height * 4u;
+    const VkDeviceSize readbackOffset = outputBytes <= g_readbackBytes
+        ? g_readbackOffset : (kUploadBytes - outputBytes) & ~VkDeviceSize(255);
     VkBufferImageCopy copy{};
-    copy.bufferOffset = g_readbackOffset;
+    copy.bufferOffset = readbackOffset;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {g_outputExtent.width, g_outputExtent.height, 1};
     p_vkCmdCopyImageToBuffer(g_commandBuffer, target.image,
@@ -206,7 +241,7 @@ static void CheckFxaaOrientation(const std::filesystem::path& capturePath)
             "wait FXAA orientation probe");
     g_frameOpen = false;
 
-    const uint8_t* pixels = g_uploadMapped + g_readbackOffset;
+    const uint8_t* pixels = g_uploadMapped + readbackOffset;
     WriteProbeBmp(capturePath, pixels, g_outputExtent, g_swapFormat);
     const auto isRed = [&](uint32_t x, uint32_t y) {
         const uint8_t* pixel = pixels + (size_t(y) * g_outputExtent.width + x) * 4u;
@@ -231,7 +266,11 @@ static void CheckFxaaOrientation(const std::filesystem::path& capturePath)
     g_imageInitialized = savedInitialized;
     DestroyProbeImage(target);
     VkPresenter_Shutdown();
-    std::puts("PASS: FXAA preserves top-to-bottom presentation orientation");
+    std::puts(probe == PresentationProbe::FsrEasu
+                  ? "PASS: FXAA + FSR 1 EASU + RCAS preserve presentation orientation and colour"
+              : probe == PresentationProbe::FsrRcasOnly
+                  ? "PASS: FXAA + RCAS-only presentation preserves orientation and colour"
+                  : "PASS: FXAA preserves top-to-bottom presentation orientation");
 }
 
 static void CheckPixels(bool dummy, bool rectangle = false, bool tiledResolve = false)
@@ -613,6 +652,16 @@ int main(int argc, char** argv)
         {
             CheckFxaaOrientation(argc >= 3 ? std::filesystem::path(argv[2])
                                             : std::filesystem::path{});
+            return 0;
+        }
+        if (argc >= 2 && (std::string_view(argv[1]) == "--fsr-easu" ||
+                          std::string_view(argv[1]) == "--fsr-rcas"))
+        {
+            CheckFxaaOrientation(argc >= 3 ? std::filesystem::path(argv[2])
+                                            : std::filesystem::path{},
+                                 std::string_view(argv[1]) == "--fsr-easu"
+                                     ? PresentationProbe::FsrEasu
+                                     : PresentationProbe::FsrRcasOnly);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resolve-rect-cpu")

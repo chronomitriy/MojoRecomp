@@ -115,6 +115,31 @@ if(BUILD_TESTING)
         host/stutter_profiler.cpp)
     add_test(NAME StutterProfiler COMMAND MojoRecompStutterProfilerTest)
     set_tests_properties(StutterProfiler PROPERTIES TIMEOUT 10 LABELS "host;performance")
+    add_executable(MojoRecompGuestProfilerTest
+        tests/guest_profiler_test.cpp
+        host/guest_profiler.cpp)
+    if(WIN32)
+        # The Windows sampler in the same file reads the runtime configuration
+        # and logs through klog.
+        target_sources(MojoRecompGuestProfilerTest PRIVATE
+            config/runtime_config.cpp
+            kernel/klog.cpp
+            host/host_paths.cpp
+            host/pipeline_metrics.cpp
+            host/timing.cpp)
+        target_include_directories(MojoRecompGuestProfilerTest PRIVATE
+            "${MOJORECOMP_TOMLPLUSPLUS_ROOT}")
+    endif()
+    add_test(NAME GuestProfiler COMMAND MojoRecompGuestProfilerTest)
+    set_tests_properties(GuestProfiler PROPERTIES TIMEOUT 10 LABELS "host;performance")
+    add_executable(MojoRecompGpuProfileTest
+        tests/gpu_profile_test.cpp
+        gpu/gpu_profile.cpp)
+    add_test(NAME GpuProfile COMMAND MojoRecompGpuProfileTest)
+    set_tests_properties(GpuProfile PROPERTIES TIMEOUT 10 LABELS "gpu;performance")
+    add_executable(MojoRecompFsr1Test tests/fsr1_test.cpp)
+    add_test(NAME Fsr1 COMMAND MojoRecompFsr1Test)
+    set_tests_properties(Fsr1 PROPERTIES TIMEOUT 10 LABELS "gpu;postprocess")
     add_executable(MojoRecompFrameRatePolicyTest tests/frame_rate_policy_test.cpp)
     add_test(NAME FrameRatePolicy COMMAND MojoRecompFrameRatePolicyTest)
     set_tests_properties(FrameRatePolicy PROPERTIES TIMEOUT 10 LABELS "host;timing")
@@ -469,8 +494,10 @@ set(MOJORECOMP_KERNEL_SOURCES
     gpu/shader_cache.cpp
     gpu/shader_metadata.cpp
     gpu/shader_replacement.cpp
+    gpu/gpu_profile.cpp
     gpu/vk_presenter.cpp
     gpu/vd.cpp
+    host/guest_profiler.cpp
     host/input.cpp
     host/pipeline_metrics.cpp
     host/presentation_metrics.cpp
@@ -571,6 +598,7 @@ if(BUILD_TESTING AND WIN32)
         gpu/shader_cache.cpp
         gpu/shader_metadata.cpp
         gpu/shader_replacement.cpp
+        gpu/gpu_profile.cpp
         gpu/guest_memory_snapshot.cpp
         gpu/pm4.cpp
         kernel/klog.cpp
@@ -601,6 +629,10 @@ if(BUILD_TESTING AND WIN32)
     set_tests_properties(AuthoredMipGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu")
     add_test(NAME FxaaOrientationGpuProbe COMMAND MojoRecompTextureGpuProbe --fxaa-orientation)
     set_tests_properties(FxaaOrientationGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu;postprocess")
+    add_test(NAME FsrEasuGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-easu)
+    add_test(NAME FsrRcasGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-rcas)
+    set_tests_properties(FsrEasuGpuProbe FsrRcasGpuProbe PROPERTIES TIMEOUT 45
+        LABELS "gpu;postprocess")
     add_test(NAME RectangleGpuProbe COMMAND MojoRecompTextureGpuProbe "${RECTANGLE_PROBE_VS}" --rectangle)
     set_tests_properties(RectangleGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu")
     add_test(NAME ResolveSourceGpuProbe COMMAND MojoRecompTextureGpuProbe "${TEXTURE_PROBE_VS}" --resolve-source)

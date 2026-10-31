@@ -95,6 +95,7 @@ const noticeFiles = [
   resolve(launcherRoot, "resources/licenses/extract-xiso-LICENSE.TXT"),
   resolve(launcherRoot, "resources/licenses/SDL3-LICENSE.txt"),
   resolve(launcherRoot, "resources/licenses/NVIDIA-FXAA-LICENSE.txt"),
+  resolve(launcherRoot, "resources/licenses/AMD-FidelityFX-FSR1-LICENSE.txt"),
 ];
 for (const path of noticeFiles) await requireFile(path, "Third-party notice material");
 await requireFile(artworkAudit, "Artwork provenance audit");

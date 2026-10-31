@@ -9,6 +9,10 @@ against Crash of the Titans; [section 9](#9-what-was-and-was-not-verified) lists
 what was verified. Guest addresses come from [HFR-PHASE2.md](HFR-PHASE2.md), which had the
 executable.
 
+> **Phase 4 update.** [HFR-PHASE4.md](HFR-PHASE4.md) (branch `hfr-phase4`) adds a motion
+> blur toggle, FSR 1 upscaling/sharpening, and GPU and guest CPU profilers, all off by
+> default.
+
 ## Contents
 
 1. [Summary](#1-summary)
