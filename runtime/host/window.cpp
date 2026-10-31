@@ -21,6 +21,7 @@ std::atomic<HWND> g_window{nullptr};
 HINSTANCE g_instance = nullptr;
 std::atomic<bool> g_alive{false};
 std::atomic<bool> g_shutdownRequested{false};
+std::atomic<void (*)()> g_beforeExitCallback{nullptr};
 constexpr wchar_t kWindowClass[] = L"MojoRecompVulkanWindow";
 constexpr UINT kApplyTitleMessage = WM_APP + 0x4D43;
 constexpr UINT_PTR kDebugTimerId = 0x4D43;
@@ -108,6 +109,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
             if (!shutdownRequested)
             {
                 KLOG("host window closed by user; terminating runtime\n");
+                if (auto* beforeExit = g_beforeExitCallback.load(std::memory_order_acquire))
+                    beforeExit();
                 ExitProcess(0);
             }
             return 0;
@@ -280,6 +283,11 @@ bool HostWindow_AcceptsInput()
     if (!window || g_minimized.load(std::memory_order_acquire))
         return false;
     return GetForegroundWindow() == window;
+}
+
+void HostWindow_SetBeforeExitCallback(void (*callback)())
+{
+    g_beforeExitCallback.store(callback, std::memory_order_release);
 }
 
 void HostWindow_SetTitle(const wchar_t* title)

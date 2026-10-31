@@ -11,5 +11,8 @@ void* HostWindow_NativeHandle();
 bool HostWindow_Alive();
 bool HostWindow_AcceptsInput();
 void HostWindow_SetTitle(const wchar_t* title);
+// Runs on the window thread right before closing the window ends the process
+// (end-of-session reports).
+void HostWindow_SetBeforeExitCallback(void (*callback)());
 bool HostWindow_ConsumeResize(uint64_t& generation, uint32_t& width,
                               uint32_t& height, bool& minimized);

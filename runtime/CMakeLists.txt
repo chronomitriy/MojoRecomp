@@ -436,6 +436,19 @@ else()
         "-include;${CMAKE_CURRENT_SOURCE_DIR}/gpu/xenos_pch.h;-Wno-switch;-Wno-unused-variable;-Wno-null-arithmetic")
 endif()
 
+if(BUILD_TESTING)
+    # Builds the motion-blur replacement from a real XenosRecomp translation of
+    # synthetic microcode; with the pinned DXC available it also compiles both
+    # programs and compares their SPIR-V interfaces.
+    add_executable(MojoRecompShaderReplacementTest
+        tests/shader_replacement_test.cpp
+        gpu/shader_replacement.cpp
+        gpu/shader_metadata.cpp)
+    target_link_libraries(MojoRecompShaderReplacementTest PRIVATE mojorecomp_shader_xlate)
+    add_test(NAME ShaderReplacement COMMAND MojoRecompShaderReplacementTest)
+    set_tests_properties(ShaderReplacement PROPERTIES TIMEOUT 60 LABELS "gpu;shader")
+endif()
+
 set(MOJORECOMP_KERNEL_SOURCES
     config/runtime_config.cpp
     debug_mode.cpp
@@ -455,6 +468,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     gpu/guest_memory_snapshot.cpp
     gpu/shader_cache.cpp
     gpu/shader_metadata.cpp
+    gpu/shader_replacement.cpp
     gpu/vk_presenter.cpp
     gpu/vd.cpp
     host/input.cpp
@@ -476,6 +490,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     title_resources.cpp
     title_hooks.cpp
     title_hfr_discovery.cpp
+    title_pixel_shaders.cpp
     guest_native.cpp)
 
 if(BUILD_TESTING AND WIN32)
@@ -555,6 +570,7 @@ if(BUILD_TESTING AND WIN32)
         host/crash_reporter_stub.cpp
         gpu/shader_cache.cpp
         gpu/shader_metadata.cpp
+        gpu/shader_replacement.cpp
         gpu/guest_memory_snapshot.cpp
         gpu/pm4.cpp
         kernel/klog.cpp

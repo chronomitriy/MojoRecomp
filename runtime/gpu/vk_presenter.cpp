@@ -45,10 +45,13 @@
 #include "../subtitles/subtitle_runtime.h"
 #include "pm4.h"
 #include "frame_hash_map.h"
+#include "fsr1.h"
+#include "gpu_profile.h"
 #include "guest_memory_snapshot.h"
 #include "index_scan.h"
 #include "shader_cache.h"
 #include "shader_metadata.h"
+#include "shader_replacement.h"
 #include "shader_translator.h"
 #include "texture_abi.h"
 #include "render_policy.h"
@@ -429,6 +432,10 @@ struct FrameContext
     bool timestampPending = false;
     uint32_t timestampDrawCount = 0;
     uint64_t timestampFrame = 0;
+    // MOJORECOMP_GPU_PROFILE: one timestamp per change of work category.
+    VkQueryPool profilePool = VK_NULL_HANDLE;
+    bool profilePending = false;
+    mojorecomp::gpu::GpuProfileFrame profile;
 };
 std::array<FrameContext, kMaxFramesInFlight> g_frameContexts{};
 uint32_t g_framesInFlight = 1;
@@ -618,6 +625,31 @@ bool g_fxaaAssetsAttempted = false;
 bool g_fxaaAssetsPrepared = false;
 bool g_fxaaResourcesAttempted = false;
 bool g_fxaaResourcesReady = false;
+
+// FSR 1 presentation (MOJORECOMP_UPSCALER=fsr1 or rcas; fsr1.h). Each target
+// owns a descriptor set that samples it.
+struct FsrTarget
+{
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkExtent2D extent{};
+    VkDescriptorSet descriptor = VK_NULL_HANDLE;
+};
+// The source crop at the work resolution, FXAA's result, EASU's result.
+FsrTarget g_fsrInput;
+FsrTarget g_fsrAa;
+FsrTarget g_fsrEasu;
+VkDescriptorPool g_fsrDescriptorPool = VK_NULL_HANDLE;
+VkPipelineLayout g_fsrPipelineLayout = VK_NULL_HANDLE;
+VkPipeline g_fsrEasuPipeline = VK_NULL_HANDLE;
+VkPipeline g_fsrRcasPipeline = VK_NULL_HANDLE;
+VkShaderModule g_fsrVs = VK_NULL_HANDLE;
+VkShaderModule g_fsrEasuPs = VK_NULL_HANDLE;
+VkShaderModule g_fsrRcasPs = VK_NULL_HANDLE;
+bool g_fsrAttempted = false;
+bool g_fsrReady = false;
 
 constexpr uint32_t kMaxGpuTimedDraws = 1024;
 constexpr uint32_t kGpuTimestampQueryCount = 2 + kMaxGpuTimedDraws * 2;
@@ -1681,6 +1713,65 @@ PFN_vkCmdBindDescriptorSets p_vkCmdBindDescriptorSets = nullptr;
 PFN_vkCreateSampler p_vkCreateSampler = nullptr;
 PFN_vkDestroySampler p_vkDestroySampler = nullptr;
 
+// MOJORECOMP_GPU_PROFILE=1: GPU time per kind of work. A timestamp is written
+// whenever the recorded work changes category; the interval up to the next one
+// is charged to that category. Off by default; then every helper below returns
+// at its first branch.
+using mojorecomp::gpu::GpuPassCategory;
+constexpr uint32_t kGpuProfileQueryCount = 4096;
+bool g_gpuProfile = false;
+GpuPassCategory g_gpuProfileCategory = GpuPassCategory::Other;
+mojorecomp::gpu::GpuProfileAccumulator g_gpuProfileAccumulator{120};
+
+void GpuProfileMark(GpuPassCategory category)
+{
+    if (!g_gpuProfile || !g_frameOpen)
+        return;
+    auto& frame = g_frameContexts[g_frameSlot];
+    auto& profile = frame.profile;
+    if (!frame.profilePool || (!profile.categories.empty() && profile.categories.back() == category))
+        return;
+    // The last query closes the frame.
+    if (profile.categories.size() + 1 >= kGpuProfileQueryCount)
+    {
+        profile.overflow = true;
+        return;
+    }
+    p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          frame.profilePool, static_cast<uint32_t>(profile.categories.size()));
+    profile.categories.push_back(category);
+    g_gpuProfileCategory = category;
+}
+
+// Charges the enclosed work to `category`, then returns to the enclosing one.
+class GpuProfileScope
+{
+public:
+    explicit GpuProfileScope(GpuPassCategory category)
+        : previous_(g_gpuProfileCategory), active_(g_gpuProfile && g_frameOpen)
+    {
+        if (active_)
+            GpuProfileMark(category);
+    }
+    ~GpuProfileScope()
+    {
+        if (active_)
+            GpuProfileMark(previous_);
+    }
+    GpuProfileScope(const GpuProfileScope&) = delete;
+    GpuProfileScope& operator=(const GpuProfileScope&) = delete;
+
+private:
+    GpuPassCategory previous_;
+    bool active_;
+};
+
+void GpuProfileCount(uint32_t mojorecomp::gpu::GpuProfileCounts::*counter)
+{
+    if (g_gpuProfile)
+        ++(g_frameContexts[g_frameSlot].profile.counts.*counter);
+}
+
 struct GraphicsCommandStateCache
 {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -2450,6 +2541,20 @@ bool CreateCommandState()
             if (p_vkCreateQueryPool(g_device, &queryInfo, nullptr, &frame.timestampPool) != VK_SUCCESS)
                 return false;
         }
+        if (g_gpuProfile)
+        {
+            VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryInfo.queryCount = kGpuProfileQueryCount;
+            if (p_vkCreateQueryPool(g_device, &queryInfo, nullptr, &frame.profilePool) != VK_SUCCESS)
+            {
+                // Profiling is diagnostic; never fail presentation over it.
+                KLOG("[gpu-profile] query pool creation failed; profiling disabled\n");
+                g_gpuProfile = false;
+            }
+            else
+                frame.profile.categories.reserve(kGpuProfileQueryCount);
+        }
     }
     if (!CreatePresentReadySemaphores())
         return false;
@@ -2463,6 +2568,10 @@ bool CreateCommandState()
     if (g_gpuDrawTimestamps)
         KLOG("Vulkan GPU draw timestamps ACTIVE: maxDraws=%u period=%.3f ns validBits=%u\n",
              kMaxGpuTimedDraws, g_gpuTimestampPeriodNs, g_gpuTimestampValidBits);
+    if (g_gpuProfile)
+        KLOG("[gpu-profile] ACTIVE: per-category timestamps, %u queries/frame, report every "
+             "120 frames, period=%.3f ns validBits=%u\n",
+             kGpuProfileQueryCount, g_gpuTimestampPeriodNs, g_gpuTimestampValidBits);
     return true;
 }
 
@@ -2655,6 +2764,7 @@ void ResumeColorRendering(bool clearColor = false)
     ri.pStencilAttachment = depthBacking ? &stencil : nullptr;
     p_vkCmdBeginRendering(g_commandBuffer, &ri);
     g_rendering = true;
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::renderPasses);
 }
 ResolveSnapshot* FindSnapshot(uint32_t key)
 {
@@ -4642,6 +4752,8 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         // contents even though the table says the destination owns the tiles.
         return false;
     }
+    GpuProfileScope gpuProfileScope(GpuPassCategory::Transfer);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::transfers);
 
     const bool sourceDepthFloat24 =
         source.kind == EdramOwnerKind::Depth && ((source.info >> 16) & 1u) != 0;
@@ -5086,6 +5198,8 @@ bool SwitchActiveColorSurfaces(uint32_t surfaceInfo, uint32_t color0Info,
         if (firstUse1)
         {
             EndColorRendering();
+            GpuProfileScope gpuProfileScope(GpuPassCategory::Clear);
+            GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::clears);
             VkClearColorValue clear{};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             TransitionColorBacking(*color1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -5128,6 +5242,8 @@ bool SwitchActiveDepthSurface(uint32_t surfaceInfo, uint32_t depthInfo, bool dep
     const bool firstUse = !backing->initialized;
     if (firstUse)
     {
+        GpuProfileScope gpuProfileScope(GpuPassCategory::Clear);
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::clears);
         TransitionDepthBacking(*backing, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearDepthStencilValue clear{1.0f, 0};
         VkImageSubresourceRange range{
@@ -5816,6 +5932,8 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
                                               "depth-resolve-clear"))
             return false;
         ResumeColorRendering(false);
+        GpuProfileMark(GpuPassCategory::Clear);
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::clears);
         ++g_perfDepthClears;
         const VkRect2D clearRect{{copy.srcOffset.x, copy.srcOffset.y},
                                  {copy.extent.width, copy.extent.height}};
@@ -5947,6 +6065,8 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
 {
     if (!BeginFrame())
         return false;
+    GpuProfileScope gpuProfileScope(GpuPassCategory::Resolve);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::resolves);
 
     g_resolves.fetch_add(1, std::memory_order_relaxed);
     if (SkipDuplicateResolve(regs))
@@ -6154,6 +6274,8 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
         rect.rect = ScaleRectToInternal(clearRect);
         rect.baseArrayLayer = 0;
         rect.layerCount = 1;
+        GpuProfileMark(GpuPassCategory::Clear);
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::clears);
         p_vkCmdClearAttachments(g_commandBuffer, attachmentCount, attachments.data(), 1, &rect);
         ++g_renderWriteGeneration;
     }
@@ -7063,6 +7185,8 @@ bool UpdateGuestR8Texture(GuestTexture& texture, const uint8_t* source, uint32_t
     copy.bufferOffset = uploadAt;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {texture.width, texture.height, 1};
+    GpuProfileScope gpuCopyScope0(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     g_perfTextureRefreshBytesR8 += byteCount;
@@ -7138,6 +7262,8 @@ bool UpdateGuestR8MipTexture(
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                            1, &toTransfer);
+    GpuProfileScope gpuCopyScope1(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              sourceCount, copies.data());
@@ -7449,6 +7575,8 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                            1, &toTransfer);
 
+    GpuProfileScope gpuCopyScope2(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              sourceCount, copies.data());
@@ -7579,6 +7707,8 @@ bool UpdateGuestRGBA8Texture(
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
+    GpuProfileScope gpuCopyScope3(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              mipSourceCount, copies.data());
@@ -7888,6 +8018,8 @@ GuestTexture* CreateGuestRGBA8Texture(uint8_t* guestBase,
     p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                            1, &toTransfer);
+    GpuProfileScope gpuCopyScope4(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                              mipSourceCount, copies.data());
@@ -8026,6 +8158,8 @@ bool UpdateGuestBlockCompressedTexture(GuestTexture& texture,
     copy.bufferOffset = uploadAt;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {texture.width, texture.height, 1};
+    GpuProfileScope gpuCopyScope5(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     g_perfTextureRefreshBytesBC1 += byteCount;
@@ -8218,6 +8352,8 @@ GuestTexture* CreateGuestBlockCompressedTexture(
     copy.bufferOffset = uploadAt;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {fetch.width, fetch.height, 1};
+    GpuProfileScope gpuCopyScope6(GpuPassCategory::Copy);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::copies);
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     g_perfTextureUploadBytesBC1 += byteCount;
@@ -8270,6 +8406,8 @@ ResolveSnapshot* CreateZeroSnapshotFromGuestIfEmpty(
         return nullptr;
 
     EndColorRendering();
+    GpuProfileScope gpuProfileScope(GpuPassCategory::Clear);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::clears);
     TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const VkClearColorValue clear{{0.0f, 0.0f, 0.0f, 0.0f}};
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -9045,10 +9183,12 @@ float4 main(PSIn input) : SV_Target0
     return true;
 }
 
-bool EnsureFxaaResources()
+// Pipeline, layouts, sampler and descriptor set; FSR shares the set layout,
+// the sampler and the full-screen vertex shader.
+bool EnsureFxaaPipeline()
 {
     if (g_fxaaResourcesReady)
-        return EnsureFxaaImage();
+        return true;
     if (g_fxaaResourcesAttempted)
         return false;
     g_fxaaResourcesAttempted = true;
@@ -9176,10 +9316,28 @@ bool EnsureFxaaResources()
     g_fxaaVsSpv.shrink_to_fit();
     g_fxaaPsSpv.clear();
     g_fxaaPsSpv.shrink_to_fit();
-    if (!EnsureFxaaImage())
-        return false;
     KLOG("Vulkan FXAA resources ready\n");
     return true;
+}
+
+bool EnsureFxaaResources()
+{
+    return EnsureFxaaPipeline() && EnsureFxaaImage();
+}
+
+FxaaPush FxaaPushFor(mojorecomp::config::AntiAliasing aa, VkExtent2D extent)
+{
+    FxaaPush push{};
+    push.invExtent[0] = 1.0f / static_cast<float>(extent.width);
+    push.invExtent[1] = 1.0f / static_cast<float>(extent.height);
+    if (aa == mojorecomp::config::AntiAliasing::FxaaExtreme)
+    {
+        push.edgeThreshold = 0.063f;
+        push.edgeThresholdMin = 0.0312f;
+        push.subpixel = 1.0f;
+        push.spanMax = 12.0f;
+    }
+    return push;
 }
 
 bool DrawFxaa(uint32_t imageIndex, VkImage sourceImage,
@@ -9192,6 +9350,7 @@ bool DrawFxaa(uint32_t imageIndex, VkImage sourceImage,
         return false;
     if (!EnsureFxaaResources())
         return false;
+    GpuProfileMark(GpuPassCategory::Post);
     const VkRect2D contentRect = OutputContentRect(preserveNative16x9);
     const auto sourceCrop = mojorecomp::gpu::ScenePresentationSourceCrop(
         sourceWidth, sourceHeight, ConfiguredAspectRatio(), preserveNative16x9);
@@ -9279,16 +9438,7 @@ bool DrawFxaa(uint32_t imageIndex, VkImage sourceImage,
     CmdBindDescriptorSetsCached(g_commandBuffer, g_fxaaPipelineLayout,
                                 0, 1, &g_fxaaDescriptor);
 
-    FxaaPush push{};
-    push.invExtent[0] = 1.0f / static_cast<float>(g_fxaaExtent.width);
-    push.invExtent[1] = 1.0f / static_cast<float>(g_fxaaExtent.height);
-    if (aa == mojorecomp::config::AntiAliasing::FxaaExtreme)
-    {
-        push.edgeThreshold = 0.063f;
-        push.edgeThresholdMin = 0.0312f;
-        push.subpixel = 1.0f;
-        push.spanMax = 12.0f;
-    }
+    const FxaaPush push = FxaaPushFor(aa, g_fxaaExtent);
     p_vkCmdPushConstants(g_commandBuffer, g_fxaaPipelineLayout,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
     p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
@@ -9302,6 +9452,433 @@ bool DrawFxaa(uint32_t imageIndex, VkImage sourceImage,
         KLOG("Vulkan FXAA active: preset=%s extent=%ux%u threshold=%.4f min=%.4f subpixel=%.2f span=%.1f\n",
              mojorecomp::config::ToString(aa), g_fxaaExtent.width, g_fxaaExtent.height,
              push.edgeThreshold, push.edgeThresholdMin, push.subpixel, push.spanMax);
+    }
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// FSR 1 presentation. Order: compose the source crop, FXAA at that (internal)
+// resolution when enabled, EASU to the output size, RCAS into the swapchain.
+// With `rcas`, or when the internal image is not smaller than the output, the
+// crop is scaled to the output size like the FXAA path and RCAS only sharpens.
+// Everything that can fail runs before the first command is recorded, so a
+// failure leaves the default presentation path to draw the frame.
+
+bool CreatePostProcessPipeline(VkShaderModule vs, VkShaderModule ps, VkPipelineLayout layout,
+                               VkPipeline& pipeline)
+{
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = ps;
+    stages[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blendAttachment{};
+    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = 1;
+    blend.pAttachments = &blendAttachment;
+    constexpr std::array<VkDynamicState, 2> dynamicStates{
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamic.pDynamicStates = dynamicStates.data();
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &g_swapFormat;
+    VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.pNext = &rendering;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = stages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &assembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &raster;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pColorBlendState = &blend;
+    pipelineInfo.pDynamicState = &dynamic;
+    pipelineInfo.layout = layout;
+    return p_vkCreateGraphicsPipelines(g_device, g_pipelineCache, 1, &pipelineInfo,
+                                       nullptr, &pipeline) == VK_SUCCESS;
+}
+
+bool EnsureFsrPipelines()
+{
+    if (g_fsrReady)
+        return true;
+    if (g_fsrAttempted)
+        return false;
+    g_fsrAttempted = true;
+    // Shares FXAA's set layout (sampled image + sampler) and its sampler.
+    if (!EnsureFxaaPipeline())
+        return false;
+
+    std::vector<uint8_t> vsSpv;
+    std::vector<uint8_t> easuSpv;
+    std::vector<uint8_t> rcasSpv;
+    std::string error;
+    if (!ShaderTranslator::CompileHostHlsl(mojorecomp::gpu::fsr1::kFullscreenVertexShaderHlsl,
+                                           true, vsSpv, error) ||
+        !ShaderTranslator::CompileHostHlsl(mojorecomp::gpu::fsr1::kEasuPixelShaderHlsl,
+                                           false, easuSpv, error) ||
+        !ShaderTranslator::CompileHostHlsl(mojorecomp::gpu::fsr1::kRcasPixelShaderHlsl,
+                                           false, rcasSpv, error))
+    {
+        KLOG("Vulkan FSR shader compile failed: %s\n", error.c_str());
+        return false;
+    }
+    auto createModule = [](const std::vector<uint8_t>& spirv, VkShaderModule& module) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = spirv.size();
+        info.pCode = reinterpret_cast<const uint32_t*>(spirv.data());
+        return p_vkCreateShaderModule(g_device, &info, nullptr, &module) == VK_SUCCESS;
+    };
+    if (!createModule(vsSpv, g_fsrVs) || !createModule(easuSpv, g_fsrEasuPs) ||
+        !createModule(rcasSpv, g_fsrRcasPs))
+        return false;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.size = sizeof(mojorecomp::gpu::fsr1::EasuPush);
+    static_assert(sizeof(mojorecomp::gpu::fsr1::RcasPush) <= sizeof(mojorecomp::gpu::fsr1::EasuPush));
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &g_fxaaSetLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    if (p_vkCreatePipelineLayout(g_device, &layoutInfo, nullptr, &g_fsrPipelineLayout) != VK_SUCCESS)
+        return false;
+
+    std::array<FsrTarget*, 3> targets{&g_fsrInput, &g_fsrAa, &g_fsrEasu};
+    const std::array<VkDescriptorPoolSize, 2> poolSizes{{
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, uint32_t(targets.size())},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, uint32_t(targets.size())}}};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = uint32_t(targets.size());
+    poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    poolInfo.pPoolSizes = poolSizes.data();
+    if (p_vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_fsrDescriptorPool) != VK_SUCCESS)
+        return false;
+    for (FsrTarget* target : targets)
+    {
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = g_fsrDescriptorPool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &g_fxaaSetLayout;
+        if (p_vkAllocateDescriptorSets(g_device, &allocate, &target->descriptor) != VK_SUCCESS)
+            return false;
+        VkDescriptorImageInfo sampler{};
+        sampler.sampler = g_fxaaSampler;
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = target->descriptor;
+        write.dstBinding = 1;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        write.pImageInfo = &sampler;
+        p_vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+    }
+
+    if (!CreatePostProcessPipeline(g_fsrVs, g_fsrEasuPs, g_fsrPipelineLayout, g_fsrEasuPipeline) ||
+        !CreatePostProcessPipeline(g_fsrVs, g_fsrRcasPs, g_fsrPipelineLayout, g_fsrRcasPipeline))
+        return false;
+    g_fsrReady = true;
+    KLOG("Vulkan FSR 1 resources ready (AMD FidelityFX FSR 1 EASU/RCAS, MIT)\n");
+    return true;
+}
+
+void DestroyFsrTarget(FsrTarget& target)
+{
+    if (target.view && p_vkDestroyImageView)
+        p_vkDestroyImageView(g_device, target.view, nullptr);
+    if (target.image && p_vkDestroyImage)
+        p_vkDestroyImage(g_device, target.image, nullptr);
+    if (target.memory && p_vkFreeMemory)
+        p_vkFreeMemory(g_device, target.memory, nullptr);
+    // The descriptor set belongs to the pool and is rewritten on recreation.
+    const VkDescriptorSet descriptor = target.descriptor;
+    target = {};
+    target.descriptor = descriptor;
+}
+
+bool EnsureFsrTarget(FsrTarget& target, VkExtent2D extent, VkImageUsageFlags usage,
+                     const char* name)
+{
+    if (target.image && target.extent.width == extent.width &&
+        target.extent.height == extent.height)
+        return true;
+    if (target.image)
+    {
+        // Sizes change with the output size or when native 16:9 presentation
+        // toggles; frames still in flight may sample the old image.
+        p_vkDeviceWaitIdle(g_device);
+        DestroyFsrTarget(target);
+    }
+
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = g_swapFormat;
+    imageInfo.extent = {extent.width, extent.height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = usage | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (p_vkCreateImage(g_device, &imageInfo, nullptr, &target.image) != VK_SUCCESS)
+    {
+        target.image = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    p_vkGetImageMemoryRequirements(g_device, target.image, &requirements);
+    const uint32_t memoryType = FindMemoryType(
+        requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkMemoryAllocateInfo memoryInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    memoryInfo.allocationSize = requirements.size;
+    memoryInfo.memoryTypeIndex = memoryType;
+    bool created = memoryType != UINT32_MAX &&
+        p_vkAllocateMemory(g_device, &memoryInfo, nullptr, &target.memory) == VK_SUCCESS &&
+        p_vkBindImageMemory(g_device, target.image, target.memory, 0) == VK_SUCCESS;
+    if (created)
+    {
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = target.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = g_swapFormat;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        created = p_vkCreateImageView(g_device, &viewInfo, nullptr, &target.view) == VK_SUCCESS;
+    }
+    if (!created)
+    {
+        DestroyFsrTarget(target);
+        return false;
+    }
+    target.extent = extent;
+    target.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkDescriptorImageInfo sampledImage{};
+    sampledImage.imageView = target.view;
+    sampledImage.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = target.descriptor;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &sampledImage;
+    p_vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+    KLOG("Vulkan FSR %s target ready: %ux%u\n", name, extent.width, extent.height);
+    return true;
+}
+
+void TransitionFsrTarget(FsrTarget& target, VkImageLayout newLayout)
+{
+    if (target.layout == newLayout)
+        return;
+    auto stageAndAccess = [](VkImageLayout layout, VkPipelineStageFlags& stage,
+                             VkAccessFlags& access) {
+        switch (layout)
+        {
+            case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+                stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                break;
+            case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+                stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                break;
+            case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+                stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                access = VK_ACCESS_SHADER_READ_BIT;
+                break;
+            default:
+                stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                access = 0;
+                break;
+        }
+    };
+    VkPipelineStageFlags srcStage = 0;
+    VkPipelineStageFlags dstStage = 0;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    stageAndAccess(target.layout, srcStage, barrier.srcAccessMask);
+    stageAndAccess(newLayout, dstStage, barrier.dstAccessMask);
+    barrier.oldLayout = target.layout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage, 0,
+                           0, nullptr, 0, nullptr, 1, &barrier);
+    target.layout = newLayout;
+}
+
+// One full-screen pass sampling `descriptor` into `view`, which is in
+// COLOR_ATTACHMENT_OPTIMAL. The viewport and scissor are `rect`.
+void RecordPostProcessPass(VkImageView view, VkExtent2D renderArea, const VkRect2D& rect,
+                           bool clear, VkPipeline pipeline, VkPipelineLayout layout,
+                           VkDescriptorSet descriptor, const void* push, uint32_t pushSize)
+{
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = view;
+    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.clearValue = VkClearValue{};
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, renderArea};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &attachment;
+    p_vkCmdBeginRendering(g_commandBuffer, &rendering);
+    CmdBindGraphicsPipelineCached(g_commandBuffer, pipeline);
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(rect.offset.x);
+    viewport.y = static_cast<float>(rect.offset.y);
+    viewport.width = static_cast<float>(rect.extent.width);
+    viewport.height = static_cast<float>(rect.extent.height);
+    viewport.maxDepth = 1.0f;
+    CmdSetViewportCached(g_commandBuffer, viewport);
+    CmdSetScissorCached(g_commandBuffer, rect);
+    CmdBindDescriptorSetsCached(g_commandBuffer, layout, 0, 1, &descriptor);
+    p_vkCmdPushConstants(g_commandBuffer, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushSize, push);
+    p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
+    p_vkCmdEndRendering(g_commandBuffer);
+}
+
+bool DrawFsrPresentation(uint32_t imageIndex, VkImage sourceImage,
+                         uint32_t sourceWidth, uint32_t sourceHeight,
+                         bool preserveNative16x9)
+{
+    namespace fsr1 = mojorecomp::gpu::fsr1;
+    const auto& config = mojorecomp::config::Get();
+    if (config.upscaler == mojorecomp::config::Upscaler::Bilinear ||
+        imageIndex >= g_swapViews.size() || !sourceImage)
+        return false;
+    const VkRect2D contentRect = OutputContentRect(preserveNative16x9);
+    const auto sourceCrop = mojorecomp::gpu::ScenePresentationSourceCrop(
+        sourceWidth, sourceHeight, ConfiguredAspectRatio(), preserveNative16x9);
+    const VkExtent2D cropExtent{sourceCrop.width * g_resolutionScale,
+                                sourceCrop.height * g_resolutionScale};
+    const VkExtent2D outputExtent = contentRect.extent;
+    if (!cropExtent.width || !cropExtent.height || !outputExtent.width || !outputExtent.height)
+        return false;
+    const bool easu = config.upscaler == mojorecomp::config::Upscaler::Fsr1 &&
+                      fsr1::EasuApplies(cropExtent.width, cropExtent.height,
+                                        outputExtent.width, outputExtent.height);
+    // EASU reads the crop at its own resolution; RCAS alone gets the crop
+    // already scaled to the output.
+    const VkExtent2D workExtent = easu ? cropExtent : outputExtent;
+    const auto aa = config.antiAliasing;
+    const bool fxaa = aa != mojorecomp::config::AntiAliasing::Off;
+    if (!EnsureFsrPipelines() ||
+        !EnsureFsrTarget(g_fsrInput, workExtent, VK_IMAGE_USAGE_TRANSFER_DST_BIT, "input") ||
+        (fxaa && !EnsureFsrTarget(g_fsrAa, workExtent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, "fxaa")) ||
+        (easu && !EnsureFsrTarget(g_fsrEasu, outputExtent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, "easu")))
+        return false;
+
+    GpuProfileMark(GpuPassCategory::Post);
+    TransitionFsrTarget(g_fsrInput, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkImageBlit compose{};
+    compose.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    compose.srcOffsets[0] = {
+        static_cast<int32_t>(sourceCrop.x * g_resolutionScale),
+        static_cast<int32_t>(sourceCrop.y * g_resolutionScale), 0};
+    compose.srcOffsets[1] = {
+        static_cast<int32_t>((sourceCrop.x + sourceCrop.width) * g_resolutionScale),
+        static_cast<int32_t>((sourceCrop.y + sourceCrop.height) * g_resolutionScale), 1};
+    compose.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    compose.dstOffsets[1] = {static_cast<int32_t>(workExtent.width),
+                             static_cast<int32_t>(workExtent.height), 1};
+    // 1:1 for EASU, so nearest is an exact copy.
+    p_vkCmdBlitImage(g_commandBuffer, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     g_fsrInput.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &compose,
+                     easu ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    TransitionFsrTarget(g_fsrInput, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    FsrTarget* current = &g_fsrInput;
+
+    if (fxaa)
+    {
+        TransitionFsrTarget(g_fsrAa, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const FxaaPush push = FxaaPushFor(aa, workExtent);
+        RecordPostProcessPass(g_fsrAa.view, workExtent, {{0, 0}, workExtent}, false,
+                              g_fxaaPipeline, g_fxaaPipelineLayout, g_fsrInput.descriptor,
+                              &push, sizeof(push));
+        TransitionFsrTarget(g_fsrAa, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        current = &g_fsrAa;
+    }
+
+    GpuProfileMark(GpuPassCategory::Fsr);
+    if (easu)
+    {
+        TransitionFsrTarget(g_fsrEasu, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const auto constants = fsr1::ComputeEasuConstants(
+            float(workExtent.width), float(workExtent.height),
+            float(workExtent.width), float(workExtent.height),
+            float(outputExtent.width), float(outputExtent.height));
+        const fsr1::EasuPush push{constants.con0, constants.con1, constants.con2, constants.con3};
+        RecordPostProcessPass(g_fsrEasu.view, outputExtent, {{0, 0}, outputExtent}, false,
+                              g_fsrEasuPipeline, g_fsrPipelineLayout, current->descriptor,
+                              &push, sizeof(push));
+        TransitionFsrTarget(g_fsrEasu, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        current = &g_fsrEasu;
+    }
+
+    VkImageMemoryBarrier swapToAttachment{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    swapToAttachment.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    swapToAttachment.oldLayout =
+        (imageIndex < g_imageInitialized.size() && g_imageInitialized[imageIndex])
+            ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+    swapToAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    swapToAttachment.srcQueueFamilyIndex = swapToAttachment.dstQueueFamilyIndex =
+        VK_QUEUE_FAMILY_IGNORED;
+    swapToAttachment.image = g_images[imageIndex];
+    swapToAttachment.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                           0, nullptr, 0, nullptr, 1, &swapToAttachment);
+    // RCAS reads `current` 1:1 into the content rectangle; the bars are cleared.
+    const float stops = fsr1::SharpnessToStops(config.fsrSharpness);
+    fsr1::RcasPush push{};
+    push.con = fsr1::ComputeRcasConstants(stops).con;
+    push.offset[0] = contentRect.offset.x;
+    push.offset[1] = contentRect.offset.y;
+    push.maxTexel[0] = current->extent.width - 1u;
+    push.maxTexel[1] = current->extent.height - 1u;
+    RecordPostProcessPass(g_swapViews[imageIndex], g_outputExtent, contentRect, true,
+                          g_fsrRcasPipeline, g_fsrPipelineLayout, current->descriptor,
+                          &push, sizeof(push));
+
+    static uint64_t reportedSignature = ~0ull;
+    const uint64_t signature = (uint64_t(cropExtent.width) << 48) ^
+                               (uint64_t(cropExtent.height) << 32) ^
+                               (uint64_t(outputExtent.width) << 16) ^ outputExtent.height ^
+                               (easu ? 1ull << 63 : 0) ^ (fxaa ? 1ull << 62 : 0);
+    if (signature != reportedSignature)
+    {
+        reportedSignature = signature;
+        KLOG("Vulkan FSR active: upscaler=%s %s %ux%u -> %ux%u fxaa=%s sharpness=%.2f (%.2f stops)\n",
+             mojorecomp::config::ToString(config.upscaler),
+             easu ? "EASU+RCAS" : "RCAS only", cropExtent.width, cropExtent.height,
+             outputExtent.width, outputExtent.height, mojorecomp::config::ToString(aa),
+             static_cast<double>(config.fsrSharpness), static_cast<double>(stops));
     }
     return true;
 }
@@ -10017,6 +10594,24 @@ bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
     return true;
 }
 
+// Reports the first draw of each title pixel shader the runtime knows by hash
+// (title_pixel_shaders.cpp), and whether its replacement is the one drawing.
+void NoteTitlePixelShaderDraw(uint64_t psHash, mojorecomp::gpu::PixelShaderRole role)
+{
+    static std::array<uint64_t, 3> draws{};
+    const size_t index = static_cast<size_t>(role);
+    if (index >= draws.size() || draws[index]++)
+        return;
+    const char* state = mojorecomp::gpu::ShaderReplacementApplied(psHash)
+        ? "replacement drawing"
+        : mojorecomp::gpu::TitlePixelShaderReplacementRequested(psHash)
+            ? "replacement requested but not built; original drawing"
+            : "original drawing";
+    KLOG("[ps-replace] first %s draw: PS=%016llX frame=%llu, %s\n",
+         mojorecomp::gpu::ToString(role), static_cast<unsigned long long>(psHash),
+         static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1), state);
+}
+
 ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
 {
     if (type < g_moduleIndex.size())
@@ -10710,6 +11305,32 @@ void ReportGpuDrawTimestampFrame(uint32_t slot, FrameContext& frame)
     }
 }
 
+void ReportGpuProfileFrame(FrameContext& frame)
+{
+    if (!g_gpuProfile || !frame.profilePool || !frame.profilePending)
+        return;
+    frame.profilePending = false;
+    auto& profile = frame.profile;
+    const uint32_t queryCount = static_cast<uint32_t>(profile.categories.size()) + 1u;
+    profile.timestamps.assign(queryCount, 0);
+    // The frame's fence has signalled, so the results are available.
+    const VkResult result = p_vkGetQueryPoolResults(
+        g_device, frame.profilePool, 0, queryCount,
+        VkDeviceSize(queryCount) * sizeof(uint64_t), profile.timestamps.data(),
+        sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result != VK_SUCCESS)
+    {
+        static uint32_t failures = 0;
+        if (failures++ < 4)
+            KLOG("[gpu-profile] query results unavailable: %d\n", result);
+        return;
+    }
+    g_gpuProfileAccumulator.AddFrame(profile, g_gpuTimestampValidBits,
+                                     double(g_gpuTimestampPeriodNs));
+    if (g_gpuProfileAccumulator.ReportDue())
+        KLOG("%s\n", g_gpuProfileAccumulator.FormatAndReset().c_str());
+}
+
 bool BeginFrame()
 {
     if (g_frameOpen)
@@ -10730,6 +11351,7 @@ bool BeginFrame()
         return false;
     }
     ReportGpuDrawTimestampFrame(g_frameSlot, frame);
+    ReportGpuProfileFrame(frame);
 
     if (g_readbackPending && g_readbackFrameSlot == g_frameSlot &&
         g_uploadMapped && g_readbackBytes)
@@ -10793,6 +11415,18 @@ bool BeginFrame()
         return false;
     }
     ResetGraphicsCommandStateCache(g_commandBuffer);
+    if (g_gpuProfile && frame.profilePool)
+    {
+        frame.profile.categories.clear();
+        frame.profile.timestamps.clear();
+        frame.profile.counts = {};
+        frame.profile.overflow = false;
+        p_vkCmdResetQueryPool(g_commandBuffer, frame.profilePool, 0, kGpuProfileQueryCount);
+        p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              frame.profilePool, 0);
+        frame.profile.categories.push_back(GpuPassCategory::Other);
+        g_gpuProfileCategory = GpuPassCategory::Other;
+    }
     if (g_gpuDrawTimestamps && frame.timestampPool)
     {
         frame.timestampDrawCount = 0;
@@ -10908,6 +11542,7 @@ bool BeginFrame()
     p_vkCmdBeginRendering(g_commandBuffer, &ri);
     g_rendering = true;
     g_frameOpen = true;
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::renderPasses);
     return true;
 }
 
@@ -12292,12 +12927,17 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
 
     const bool preserveNative16x9 = mojorecomp::gpu::ShouldPreserveNativePresentation(
         g_physicalTileContentFrame == currentFrame, false);
-    const bool fxaaDrawn = DrawFxaa(imageIndex, sourceImage, sourceWidth, sourceHeight,
-                                    preserveNative16x9);
-    VkImageLayout swapLayout = fxaaDrawn
+    // A render pass wrote the swapchain image: FSR (when configured and its
+    // resources are ready) or FXAA; otherwise the default blit below does.
+    const bool postDrawn =
+        DrawFsrPresentation(imageIndex, sourceImage, sourceWidth, sourceHeight,
+                            preserveNative16x9) ||
+        DrawFxaa(imageIndex, sourceImage, sourceWidth, sourceHeight, preserveNative16x9);
+    VkImageLayout swapLayout = postDrawn
         ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
         : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    if (!fxaaDrawn)
+    GpuProfileMark(GpuPassCategory::Present);
+    if (!postDrawn)
     {
         VkImageMemoryBarrier swapToWrite{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         swapToWrite.srcAccessMask = 0;
@@ -12424,6 +13064,12 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     if (g_gpuDrawTimestamps && frameContext.timestampPool)
         p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                               frameContext.timestampPool, 1);
+    const bool gpuProfileFrame = g_gpuProfile && frameContext.profilePool &&
+                                 !frameContext.profile.categories.empty();
+    if (gpuProfileFrame)
+        p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              frameContext.profilePool,
+                              static_cast<uint32_t>(frameContext.profile.categories.size()));
     const VkResult endCommandResult = p_vkEndCommandBuffer(g_commandBuffer);
     if (endCommandResult != VK_SUCCESS)
     {
@@ -12439,7 +13085,7 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
         ReportVulkanFailureResult("vkResetFences", resetFenceResult, "present_submit");
         return false;
     }
-    const VkPipelineStageFlags waitStage = fxaaDrawn
+    const VkPipelineStageFlags waitStage = postDrawn
         ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
         : VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -12465,6 +13111,8 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     }
     if (g_gpuDrawTimestamps && frameContext.timestampPool)
         frameContext.timestampPending = true;
+    if (gpuProfileFrame)
+        frameContext.profilePending = true;
     if (captureRaster)
     {
         g_readbackPending = true;
@@ -12717,6 +13365,9 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     const char* gpuTimestampEnv = std::getenv("MOJORECOMP_GPU_DRAW_TIMESTAMPS");
     g_gpuDrawTimestamps = gpuTimestampEnv && std::strcmp(gpuTimestampEnv, "1") == 0 &&
                           g_gpuTimestampSupported;
+    g_gpuProfile = mojorecomp::config::Get().gpuProfile && g_gpuTimestampSupported;
+    if (mojorecomp::config::Get().gpuProfile && !g_gpuProfile)
+        KLOG("[gpu-profile] requested, but this device has no graphics-queue timestamps\n");
     KLOG("Vulkan GPU: %s (api %u.%u.%u, driver=%08X)\n", properties.deviceName,
          VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion),
          VK_VERSION_PATCH(properties.apiVersion), properties.driverVersion);
@@ -12998,6 +13649,9 @@ bool VkPresenter_SetOutputExtent(uint32_t width, uint32_t height)
 bool VkPresenter_ValidateConfiguredPostProcess()
 {
     if (!g_active)
+        return false;
+    if (mojorecomp::config::Get().upscaler != mojorecomp::config::Upscaler::Bilinear &&
+        !EnsureFsrPipelines())
         return false;
     const auto aa = mojorecomp::config::Get().antiAliasing;
     if (aa == mojorecomp::config::AntiAliasing::Off)
@@ -14115,6 +14769,14 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                                   frame.timestampPool, query);
         }
     }
+    const auto psRole = mojorecomp::gpu::TitlePixelShaderRole(psHash);
+    if (psRole != mojorecomp::gpu::PixelShaderRole::None)
+        NoteTitlePixelShaderDraw(psHash, psRole);
+    GpuProfileMark(psRole == mojorecomp::gpu::PixelShaderRole::MotionBlur
+                       ? GpuPassCategory::FrontPass : GpuPassCategory::Scene);
+    GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::draws);
+    if (psRole == mojorecomp::gpu::PixelShaderRole::MotionBlur)
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::frontPassDraws);
     ++g_renderWriteGeneration;
     if (prepared.indexed)
     {
@@ -14752,6 +15414,30 @@ void VkPresenter_Shutdown()
         p_vkDestroyImage(g_device, g_overlayAtlasImage, nullptr);
     if (g_overlayAtlasMemory && p_vkFreeMemory)
         p_vkFreeMemory(g_device, g_overlayAtlasMemory, nullptr);
+    for (VkPipeline pipeline : {g_fsrEasuPipeline, g_fsrRcasPipeline})
+        if (pipeline && p_vkDestroyPipeline)
+            p_vkDestroyPipeline(g_device, pipeline, nullptr);
+    for (VkShaderModule module : {g_fsrVs, g_fsrEasuPs, g_fsrRcasPs})
+        if (module && p_vkDestroyShaderModule)
+            p_vkDestroyShaderModule(g_device, module, nullptr);
+    if (g_fsrPipelineLayout && p_vkDestroyPipelineLayout)
+        p_vkDestroyPipelineLayout(g_device, g_fsrPipelineLayout, nullptr);
+    if (g_fsrDescriptorPool && p_vkDestroyDescriptorPool)
+        p_vkDestroyDescriptorPool(g_device, g_fsrDescriptorPool, nullptr);
+    for (FsrTarget* target : {&g_fsrInput, &g_fsrAa, &g_fsrEasu})
+    {
+        DestroyFsrTarget(*target);
+        *target = {};
+    }
+    g_fsrEasuPipeline = VK_NULL_HANDLE;
+    g_fsrRcasPipeline = VK_NULL_HANDLE;
+    g_fsrVs = VK_NULL_HANDLE;
+    g_fsrEasuPs = VK_NULL_HANDLE;
+    g_fsrRcasPs = VK_NULL_HANDLE;
+    g_fsrPipelineLayout = VK_NULL_HANDLE;
+    g_fsrDescriptorPool = VK_NULL_HANDLE;
+    g_fsrAttempted = false;
+    g_fsrReady = false;
     if (g_fxaaPipeline && p_vkDestroyPipeline)
         p_vkDestroyPipeline(g_device, g_fxaaPipeline, nullptr);
     if (g_fxaaVs && p_vkDestroyShaderModule)
@@ -14900,6 +15586,8 @@ void VkPresenter_Shutdown()
     {
         if (g_device && frame.timestampPool && p_vkDestroyQueryPool)
             p_vkDestroyQueryPool(g_device, frame.timestampPool, nullptr);
+        if (g_device && frame.profilePool && p_vkDestroyQueryPool)
+            p_vkDestroyQueryPool(g_device, frame.profilePool, nullptr);
         if (g_device && frame.fence && p_vkDestroyFence)
             p_vkDestroyFence(g_device, frame.fence, nullptr);
         if (g_device && frame.imageAvailable && p_vkDestroySemaphore)
@@ -14909,6 +15597,7 @@ void VkPresenter_Shutdown()
         frame = {};
     }
     g_gpuDrawTimestamps = false;
+    g_gpuProfile = false;
     g_gpuTimestampSupported = false;
     g_gpuTimestampValidBits = 0;
     g_gpuTimestampPeriodNs = 0.0f;

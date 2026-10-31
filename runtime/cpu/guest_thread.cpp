@@ -14,6 +14,7 @@
 
 #include "timebase.h"
 
+#include "../host/guest_profiler.h"
 #include "../kernel/guestcall.h"
 #include "../kernel/heap.h"
 #include "../kernel/memory.h"
@@ -175,6 +176,7 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber, uint32_t stackSize,
     ppc.fpscr.loadFromHost();
     g_ppcContext = &ppc;
     RegisterKernelClockThread(this);
+    mojorecomp::host::GuestProfilerRegisterCurrentThread(threadId);
 
     std::fprintf(stderr,
                  "[cpu] bootstrap PCR=%08X TLS=%08X TEB=%08X stack=%08X..%08X (%u bytes)\n",
@@ -183,6 +185,7 @@ GuestThreadContext::GuestThreadContext(uint32_t cpuNumber, uint32_t stackSize,
 
 GuestThreadContext::~GuestThreadContext()
 {
+    mojorecomp::host::GuestProfilerUnregisterCurrentThread();
     mojorecomp::fiber::Shutdown();
     if (teb)
         UnregisterKernelClockThread(this);

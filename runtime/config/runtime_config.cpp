@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
+#include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 
@@ -69,6 +72,95 @@ bool ApplyEnvString(const char* name, auto parser, auto& target, std::string& er
         return false;
     }
     target = parsed;
+    return true;
+}
+
+bool ReadGraphicsExtensions(const toml::table& graphics, RuntimeConfig& config,
+                            const char* source, std::string& error)
+{
+    const std::string prefix = std::string(source) + ": ";
+    if (const auto* node = graphics.get("motion_blur"))
+    {
+        const auto value = node->value<bool>();
+        if (!value || !node->is_boolean())
+        {
+            error = prefix + "graphics.motion_blur must be true or false";
+            return false;
+        }
+        config.motionBlur = *value;
+    }
+    if (const auto* node = graphics.get("upscaler"))
+    {
+        const auto value = node->value<std::string>();
+        if (!value || !ParseUpscaler(*value, config.upscaler))
+        {
+            error = prefix + "graphics.upscaler must be \"bilinear\", \"fsr1\" or \"rcas\"";
+            return false;
+        }
+    }
+    if (const auto* node = graphics.get("fsr_sharpness"))
+    {
+        std::optional<double> value;
+        if (node->is_floating_point())
+            value = node->value<double>();
+        else if (node->is_integer())
+            value = static_cast<double>(*node->value<int64_t>());
+        if (!value || !ValidFsrSharpness(*value))
+        {
+            error = prefix + "graphics.fsr_sharpness must be a number from 0.0 to 1.0";
+            return false;
+        }
+        config.fsrSharpness = static_cast<float>(*value);
+    }
+    return true;
+}
+
+bool ReadProfiling(const toml::table& profiling, RuntimeConfig& config,
+                   const char* source, std::string& error)
+{
+    const std::string prefix = std::string(source) + ": ";
+    if (const auto* node = profiling.get("guest_profile"))
+    {
+        bool ok = false;
+        if (node->is_boolean())
+        {
+            config.guestProfile = *node->value<bool>()
+                ? GuestProfileMode::MainThread : GuestProfileMode::Off;
+            ok = true;
+        }
+        else if (const auto value = node->value<std::string>())
+            ok = ParseGuestProfileMode(*value, config.guestProfile);
+        if (!ok)
+        {
+            error = prefix + "profiling.guest_profile must be \"off\", \"main\", \"all\" or a boolean";
+            return false;
+        }
+    }
+    if (const auto* node = profiling.get("gpu_profile"))
+    {
+        if (!node->is_boolean())
+        {
+            error = prefix + "profiling.gpu_profile must be true or false";
+            return false;
+        }
+        config.gpuProfile = *node->value<bool>();
+    }
+    return true;
+}
+
+bool RejectUnknownKeys(const toml::table& table, std::initializer_list<std::string_view> known,
+                       const std::string& where, std::string& error)
+{
+    for (const auto& [key, node] : table)
+    {
+        (void)node;
+        const std::string_view name = key.str();
+        if (std::find(known.begin(), known.end(), name) == known.end())
+        {
+            error = where + "unknown key '" + std::string(name) + "'";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -155,6 +247,51 @@ bool ParseBool(const std::string& value, bool& out)
         return true;
     }
     return false;
+}
+
+bool ParseUpscaler(const std::string& value, Upscaler& out)
+{
+    const std::string v = Lower(value);
+    if (v == "bilinear" || v == "default" || v == "off" || v == "none")
+        out = Upscaler::Bilinear;
+    else if (v == "fsr1" || v == "fsr" || v == "fsr_1" || v == "fsr-1")
+        out = Upscaler::Fsr1;
+    else if (v == "rcas" || v == "sharpen")
+        out = Upscaler::Rcas;
+    else
+        return false;
+    return true;
+}
+
+bool ValidFsrSharpness(double value)
+{
+    return std::isfinite(value) && value >= 0.0 && value <= 1.0;
+}
+
+bool ParseFsrSharpness(const std::string& value, float& out)
+{
+    if (value.empty())
+        return false;
+    char* end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    if (end == value.c_str() || *end != '\0' || !ValidFsrSharpness(parsed))
+        return false;
+    out = static_cast<float>(parsed);
+    return true;
+}
+
+bool ParseGuestProfileMode(const std::string& value, GuestProfileMode& out)
+{
+    const std::string v = Lower(value);
+    if (v == "0" || v == "off" || v == "false" || v == "no")
+        out = GuestProfileMode::Off;
+    else if (v == "1" || v == "on" || v == "true" || v == "yes" || v == "main")
+        out = GuestProfileMode::MainThread;
+    else if (v == "all" || v == "2")
+        out = GuestProfileMode::AllThreads;
+    else
+        return false;
+    return true;
 }
 
 bool ParseLocalizationProfile(const std::string& value, std::string& profile,
@@ -291,6 +428,15 @@ bool LoadFile(const std::filesystem::path& path, RuntimeConfig& out, std::string
                 }
                 loaded.textureFiltering = static_cast<uint32_t>(*filteringInt);
             }
+            // Not written by the launcher 1.1.0; a later launcher may write them.
+            if (!ReadGraphicsExtensions(*graphics, loaded, "settings", error))
+                return false;
+        }
+
+        if (const toml::table* profiling = root["profiling"].as_table())
+        {
+            if (!ReadProfiling(*profiling, loaded, "settings", error))
+                return false;
         }
 
         out = std::move(loaded);
@@ -308,6 +454,73 @@ bool LoadFile(const std::filesystem::path& path, RuntimeConfig& out, std::string
     }
 }
 
+bool LoadCustomSettingsFile(const std::filesystem::path& path, RuntimeConfig& config,
+                            std::string& error)
+{
+    try
+    {
+        const toml::table root = toml::parse_file(path.string());
+        if (!RejectUnknownKeys(root, {"schema_version", "graphics", "profiling"},
+                               "custom-settings: ", error))
+            return false;
+        if (const auto* schema = root.get("schema_version"))
+        {
+            if (!schema->is_integer() || *schema->value<int64_t>() != 1)
+            {
+                error = "custom-settings: unsupported schema_version";
+                return false;
+            }
+        }
+        RuntimeConfig updated = config;
+        if (const auto* node = root.get("graphics"))
+        {
+            const toml::table* graphics = node->as_table();
+            if (!graphics)
+            {
+                error = "custom-settings: [graphics] must be a table";
+                return false;
+            }
+            if (!RejectUnknownKeys(*graphics, {"motion_blur", "upscaler", "fsr_sharpness"},
+                                   "custom-settings: [graphics] ", error) ||
+                !ReadGraphicsExtensions(*graphics, updated, "custom-settings", error))
+                return false;
+        }
+        if (const auto* node = root.get("profiling"))
+        {
+            const toml::table* profiling = node->as_table();
+            if (!profiling)
+            {
+                error = "custom-settings: [profiling] must be a table";
+                return false;
+            }
+            if (!RejectUnknownKeys(*profiling, {"guest_profile", "gpu_profile"},
+                                   "custom-settings: [profiling] ", error) ||
+                !ReadProfiling(*profiling, updated, "custom-settings", error))
+                return false;
+        }
+        config = updated;
+        return true;
+    }
+    catch (const toml::parse_error& parseError)
+    {
+        error = "Could not parse custom-settings TOML: " +
+                std::string(parseError.description());
+        return false;
+    }
+    catch (const std::exception& exception)
+    {
+        error = "Could not load custom-settings: " + std::string(exception.what());
+        return false;
+    }
+}
+
+std::filesystem::path CustomSettingsPathFor(const std::filesystem::path& settingsPath)
+{
+    if (const char* custom = std::getenv("MOJORECOMP_CUSTOM_SETTINGS"); custom && *custom)
+        return std::filesystem::path(custom);
+    return settingsPath.parent_path() / "custom-settings.toml";
+}
+
 bool ApplyEnvironmentOverrides(RuntimeConfig& config, std::string& error)
 {
     if (!ApplyEnvString("MOJORECOMP_DISPLAY_MODE", ParseDisplayMode, config.displayMode, error) ||
@@ -315,7 +528,14 @@ bool ApplyEnvironmentOverrides(RuntimeConfig& config, std::string& error)
         !ApplyEnvString("MOJORECOMP_VSYNC", ParseBool, config.vsync, error) ||
         !ApplyEnvString("MOJORECOMP_ANTI_ALIASING", ParseAntiAliasing, config.antiAliasing, error) ||
         !ApplyEnvString("MOJORECOMP_TEXTURE_FILTERING", ParseTextureFiltering,
-                        config.textureFiltering, error))
+                        config.textureFiltering, error) ||
+        !ApplyEnvString("MOJORECOMP_MOTION_BLUR", ParseBool, config.motionBlur, error) ||
+        !ApplyEnvString("MOJORECOMP_UPSCALER", ParseUpscaler, config.upscaler, error) ||
+        !ApplyEnvString("MOJORECOMP_FSR_SHARPNESS", ParseFsrSharpness,
+                        config.fsrSharpness, error) ||
+        !ApplyEnvString("MOJORECOMP_GUEST_PROFILE", ParseGuestProfileMode,
+                        config.guestProfile, error) ||
+        !ApplyEnvString("MOJORECOMP_GPU_PROFILE", ParseBool, config.gpuProfile, error))
         return false;
 
     if (const char* value = std::getenv("MOJORECOMP_LOCALIZATION_PROFILE"); value && *value)
@@ -385,6 +605,26 @@ const char* ToString(AntiAliasing value)
     {
         case AntiAliasing::Fxaa: return "fxaa";
         case AntiAliasing::FxaaExtreme: return "fxaa_extreme";
+        default: return "off";
+    }
+}
+
+const char* ToString(Upscaler value)
+{
+    switch (value)
+    {
+        case Upscaler::Fsr1: return "fsr1";
+        case Upscaler::Rcas: return "rcas";
+        default: return "bilinear";
+    }
+}
+
+const char* ToString(GuestProfileMode value)
+{
+    switch (value)
+    {
+        case GuestProfileMode::MainThread: return "main";
+        case GuestProfileMode::AllThreads: return "all";
         default: return "off";
     }
 }

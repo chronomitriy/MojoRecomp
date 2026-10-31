@@ -11,6 +11,7 @@
 
 #include "../kernel/klog.h"
 #include "../host/host_paths.h"
+#include "shader_replacement.h"
 #include "shader_translator.h"
 
 namespace {
@@ -79,7 +80,7 @@ bool ReadTextFile(const std::filesystem::path& path, std::string& out)
 }
 
 bool LoadDiskTranslationFiles(const std::string& name, uint64_t expectedCodeHash,
-                              ShaderTranslator::Result& out)
+                              ShaderTranslator::Result& out, uint32_t& sizeBytes)
 {
     const auto dir = ShaderDiskCacheDir();
     std::vector<uint8_t> stampBytes;
@@ -93,6 +94,7 @@ bool LoadDiskTranslationFiles(const std::string& name, uint64_t expectedCodeHash
         stamp.schema != kShaderDiskCacheSchema ||
         (expectedCodeHash && stamp.codeHash != expectedCodeHash))
         return false;
+    sizeBytes = stamp.sizeBytes;
 
     if (!ReadBinaryFile(dir / (name + ".spv"), out.spirv) ||
         !ReadTextFile(dir / (name + ".meta.json"), out.metaJson) ||
@@ -194,6 +196,44 @@ const MojoTranslatedShader* FindLocked(uint32_t type, uint64_t hash)
     return nullptr;
 }
 
+bool CompileReplacementPixelShader(const std::string& hlsl, std::vector<uint8_t>& spirv,
+                                   std::string& error)
+{
+    return ShaderTranslator::CompileHostHlsl(hlsl, false, spirv, error);
+}
+
+// Title replacements (see title_pixel_shaders.cpp) apply after the disk cache
+// has stored the original, so turning a feature back on needs no cache reset.
+void ApplyTitleShaderReplacement(uint32_t type, uint64_t hash, uint32_t sizeDwords,
+                                 const char* name, ShaderTranslator::Result& translated)
+{
+    std::string detail;
+    const auto result = mojorecomp::gpu::ApplyTitlePixelShaderReplacement(
+        type, hash, sizeDwords, translated.hlsl, translated.spirv, translated.metaJson,
+        CompileReplacementPixelShader, detail);
+    const mojorecomp::gpu::TitlePixelShader* entry =
+        mojorecomp::gpu::FindTitlePixelShader(hash);
+    const char* role = entry ? entry->name : "";
+    switch (result)
+    {
+        case mojorecomp::gpu::ShaderReplacementResult::NotListed:
+            break;
+        case mojorecomp::gpu::ShaderReplacementResult::Observed:
+            KLOG("[ps-replace] %s (%s) loaded, observe only: %s\n", name, role, detail.c_str());
+            break;
+        case mojorecomp::gpu::ShaderReplacementResult::FeatureEnabled:
+            KLOG("[ps-replace] %s (%s) loaded, original kept (feature on)\n", name, role);
+            break;
+        case mojorecomp::gpu::ShaderReplacementResult::Replaced:
+            KLOG("[ps-replace] %s (%s) REPLACED: %s\n", name, role, detail.c_str());
+            break;
+        case mojorecomp::gpu::ShaderReplacementResult::Rejected:
+            KLOG("[ps-replace] %s (%s) replacement REJECTED, original kept: %s\n",
+                 name, role, detail.c_str());
+            break;
+    }
+}
+
 } // namespace
 
 void ShaderCache_SetTranslationEnabled(bool enabled)
@@ -256,6 +296,7 @@ void ShaderCache_OnBind(uint32_t type, uint64_t hash,
         StoreDiskTranslation(name, code, sizeBytes, translated);
     else
         g_diskHits.fetch_add(1, std::memory_order_relaxed);
+    ApplyTitleShaderReplacement(type, hash, sizeDwords, name, translated);
 
     // Diagnostic-only single-shader SPIR-V override used to A/B optimized
     // structured translations without changing the normal translator/cache.
@@ -338,8 +379,10 @@ bool ShaderCache_Preload(uint32_t type, uint64_t hash)
                   type == 0 ? "vs" : "ps",
                   static_cast<unsigned long long>(hash));
     ShaderTranslator::Result translated;
-    if (!LoadDiskTranslationFiles(name, hash, translated))
+    uint32_t sizeBytes = 0;
+    if (!LoadDiskTranslationFiles(name, hash, translated, sizeBytes))
         return false;
+    ApplyTitleShaderReplacement(type, hash, sizeBytes / 4u, name, translated);
 
     MojoTranslatedShader shader{};
     shader.type = type;

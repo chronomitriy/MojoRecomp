@@ -31,6 +31,7 @@
 #include "gpu/vk_presenter.h"
 #include "host/crash_reporter.h"
 #include "host/frame_rate_policy.h"
+#include "host/guest_profiler.h"
 #include "host/pipeline_metrics.h"
 #include "host/window.h"
 #include "kernel/heap.h"
@@ -46,6 +47,7 @@ extern "C" void MojoRecompGetLastIndirectCall(uint32_t* target, uint32_t* lr,
 #include "kernel/xex_loader.h"
 #include "mojorecomp_version.h"
 #include "subtitles/subtitle_runtime.h"
+#include "title_pixel_shaders.h"
 
 namespace {
 
@@ -770,6 +772,31 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cot-runtime: %s\n", startupError.c_str());
         return 2;
     }
+    // The official launcher rewrites settings.toml from its own fields, so the
+    // options it does not know live in custom-settings.toml beside it.
+    {
+        const char* explicitCustom = std::getenv("MOJORECOMP_CUSTOM_SETTINGS");
+        const bool customRequested = explicitCustom && *explicitCustom;
+        if (options.configPath || customRequested) {
+            const std::filesystem::path customPath = mojorecomp::config::CustomSettingsPathFor(
+                options.configPath ? *options.configPath : std::filesystem::path{});
+            std::error_code existsError;
+            if (std::filesystem::exists(customPath, existsError)) {
+                if (!mojorecomp::config::LoadCustomSettingsFile(customPath, runtimeConfig,
+                                                                startupError)) {
+                    std::fprintf(stderr, "cot-runtime: %s (%s)\n", startupError.c_str(),
+                                 customPath.string().c_str());
+                    return 2;
+                }
+                std::fprintf(stderr, "cot-runtime: custom settings applied from %s\n",
+                             customPath.string().c_str());
+            } else if (customRequested) {
+                std::fprintf(stderr, "cot-runtime: MOJORECOMP_CUSTOM_SETTINGS file not found: %s\n",
+                             customPath.string().c_str());
+                return 2;
+            }
+        }
+    }
     if (!mojorecomp::config::ApplyEnvironmentOverrides(runtimeConfig, startupError)) {
         std::fprintf(stderr, "cot-runtime: %s\n", startupError.c_str());
         return 2;
@@ -778,6 +805,20 @@ int main(int argc, char** argv) {
     mojorecomp::config::Set(runtimeConfig);
     std::fprintf(stderr, "cot-runtime: localization profile=%s xbox_language=%u\n",
                  runtimeConfig.localizationProfile.c_str(), runtimeConfig.xboxLanguage);
+    std::fprintf(stderr,
+                 "cot-runtime: graphics resolution_scale=%u anti_aliasing=%s motion_blur=%s "
+                 "upscaler=%s fsr_sharpness=%.2f; profiling guest=%s gpu=%s\n",
+                 runtimeConfig.resolutionScale,
+                 mojorecomp::config::ToString(runtimeConfig.antiAliasing),
+                 runtimeConfig.motionBlur ? "on" : "off",
+                 mojorecomp::config::ToString(runtimeConfig.upscaler),
+                 static_cast<double>(runtimeConfig.fsrSharpness),
+                 mojorecomp::config::ToString(runtimeConfig.guestProfile),
+                 runtimeConfig.gpuProfile ? "on" : "off");
+    // Before the first shader binds. Motion blur off swaps the title's motion
+    // blur pass for a one-fetch copy of its source image.
+    mojorecomp::gpu::ConfigureTitlePixelShaders(
+        CrashOfTheTitansPixelShaders(), {runtimeConfig.motionBlur, true});
     const auto frameRatePolicy = mojorecomp::host::ActiveFrameRatePolicy();
     std::fprintf(stderr,
                  "cot-runtime: frame policy simulation=%uHz presentation=%uHz display=%uHz vblank=%uHz title_patches=%u\n",
@@ -1012,6 +1053,14 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long>(mainGuestTid));
         mojorecomp::host::SetGuestMainThread(static_cast<uint32_t>(mainGuestTid));
         StartGuestThreadTimeProfile(mainGuestTid);
+        if (mojorecomp::config::Get().guestProfile != mojorecomp::config::GuestProfileMode::Off) {
+            std::vector<std::pair<uint64_t, uint32_t>> hostToGuest;
+            for (const PPCFuncMapping* m = PPCFuncMappings; m->host; ++m)
+                hostToGuest.emplace_back(reinterpret_cast<uint64_t>(m->host),
+                                         static_cast<uint32_t>(m->guest));
+            mojorecomp::host::GuestProfilerStart(hostToGuest);
+            HostWindow_SetBeforeExitCallback(mojorecomp::host::GuestProfilerReportFinal);
+        }
 #endif
         try {
             entry(thread.ppc, g_guestMemory.base);
@@ -1020,6 +1069,7 @@ int main(int argc, char** argv) {
             std::printf("CPU gate reached unimplemented import: %s (guest lr=0x%08X)\n",
                         missing.name, missing.lr);
         }
+        mojorecomp::host::GuestProfilerReportFinal();
     }
 #if defined(_WIN32)
     if (runtimeInstanceMutex)

@@ -11,6 +11,7 @@
 #include "klog.h"
 #include "memory.h"
 #include "ppc_recomp_shared.h"
+#include "../host/guest_profiler.h"
 
 // Imports occasionally need access to r13/lr or need to perform a nested guest
 // call. Every host thread currently executing translated code exposes its active
@@ -131,10 +132,15 @@ void Dispatch(PPCContext& ctx, uint8_t* base)
 
 } // namespace mojorecomp::guestcall
 
+// The profiler tag records the import and its guest call site (lr).
 #define GUEST_FUNCTION_HOOK(guest, host)                                                \
     PPC_FUNC(guest)                                                                     \
     {                                                                                   \
         KCALL(#guest);                                                                  \
+        static constexpr auto kGuestProfileActivity =                                   \
+            mojorecomp::host::ImportActivityFor(#guest);                                \
+        const mojorecomp::host::GuestActivityScope guestProfileScope(                   \
+            kGuestProfileActivity, #guest, static_cast<uint32_t>(ctx.lr));              \
         mojorecomp::guestcall::Dispatch<host>(ctx, base);                                 \
     }
 

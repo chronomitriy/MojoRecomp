@@ -18,6 +18,7 @@
 #include "gpu/pipeline_policy.h"
 #include "gpu/pm4.h"
 #include "host/frame_rate_policy.h"
+#include "host/guest_profiler.h"
 #include "host/pipeline_metrics.h"
 #include "kernel/guestcall.h"
 #include "title_hfr_discovery.h"
@@ -196,6 +197,10 @@ void MojoRecompHfrSchedulerFloor(PPCRegister& floor) {
 void MojoRecompHfrSchedulerFloor(PPCRegister& floor, PPCRegister& accumulated) {
     const bool genuineFloor = mojorecomp::host::IsTitleSchedulerFloorValue(floor.f64);
     MojoRecompHfrSchedulerFloor(floor);
+    // For the guest profiler: until the next update, the title loop only spins.
+    mojorecomp::host::SetGuestSpin(genuineFloor && accumulated.f64 < floor.f64
+                                       ? mojorecomp::host::GuestSpin::FrameGateIdle
+                                       : mojorecomp::host::GuestSpin::None);
     // The guest skips the update only when the sum is below the floor.
     if (!genuineFloor || !(accumulated.f64 >= floor.f64))
         return;
@@ -349,10 +354,12 @@ void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(end - cpWait.start).count()));
             mojorecomp::host::NoteGuestCpWaitBreakdown(cpWait.byPm4Activity, cpWait.polls);
             cpWait.active = false;
+            mojorecomp::host::SetGuestSpin(mojorecomp::host::GuestSpin::None);
         }
         if (waitingOnCp && !cpWait.active) {
             cpWait = {};
             cpWait.active = true;
+            mojorecomp::host::SetGuestSpin(mojorecomp::host::GuestSpin::CpPoll);
             cpWait.object = object;
             cpWait.observed = observedPtr;
             cpWait.start = now;

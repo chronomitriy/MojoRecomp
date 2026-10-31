@@ -172,6 +172,11 @@ void SetGuestMainThread(uint32_t hostThreadId) noexcept
     g_guestMainThreadId.store(hostThreadId, std::memory_order_release);
 }
 
+uint32_t GuestMainThreadId() noexcept
+{
+    return g_guestMainThreadId.load(std::memory_order_acquire);
+}
+
 uint64_t GuestMainThreadCpuNs() noexcept
 {
 #if defined(_WIN32)

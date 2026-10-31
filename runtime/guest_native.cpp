@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "host/guest_profiler.h"
 #include "runtime_state.h"
 
 namespace mojorecomp::guest_native {
@@ -98,6 +99,8 @@ bool Fill(uint8_t* base, uint32_t dst, uint8_t value, uint32_t bytes) noexcept
 // libc memcpy at 0x823CEC90: 8-byte and 128-byte block copy with prefetch hints.
 bool MojoRecompGuestMemcpy(PPCRegister& dst, PPCRegister& src, PPCRegister& size)
 {
+    const mojorecomp::host::GuestActivityScope profileScope(
+        mojorecomp::host::GuestActivity::NativeCrt, "memcpy", 0);
     return mojorecomp::guest_native::Enabled() &&
            mojorecomp::guest_native::CopyNonOverlapping(g_mojoGuestBase, dst.u32, src.u32,
                                                         size.u32);
@@ -106,6 +109,8 @@ bool MojoRecompGuestMemcpy(PPCRegister& dst, PPCRegister& src, PPCRegister& size
 // Second forward copy at 0x823CF0E8: word copy with an unaligned-source path.
 bool MojoRecompGuestCopyForward(PPCRegister& dst, PPCRegister& src, PPCRegister& size)
 {
+    const mojorecomp::host::GuestActivityScope profileScope(
+        mojorecomp::host::GuestActivity::NativeCrt, "copy-forward", 0);
     return mojorecomp::guest_native::Enabled() &&
            mojorecomp::guest_native::CopyNonOverlapping(g_mojoGuestBase, dst.u32, src.u32,
                                                         size.u32);
@@ -114,6 +119,8 @@ bool MojoRecompGuestCopyForward(PPCRegister& dst, PPCRegister& src, PPCRegister&
 // libc memset at 0x823CF440. It stores only the low byte of r4.
 bool MojoRecompGuestMemset(PPCRegister& dst, PPCRegister& value, PPCRegister& size)
 {
+    const mojorecomp::host::GuestActivityScope profileScope(
+        mojorecomp::host::GuestActivity::NativeCrt, "memset", 0);
     return mojorecomp::guest_native::Enabled() &&
            mojorecomp::guest_native::Fill(g_mojoGuestBase, dst.u32, uint8_t(value.u32),
                                           size.u32);

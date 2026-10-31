@@ -160,6 +160,7 @@ void NoteTitleFrameGateRelease(uint32_t intervalUs) noexcept;
 // Registers the host thread that runs the guest entry point so its CPU time can
 // be sampled from another thread. Returns 0 where the platform cannot sample.
 void SetGuestMainThread(uint32_t hostThreadId) noexcept;
+uint32_t GuestMainThreadId() noexcept;
 uint64_t GuestMainThreadCpuNs() noexcept;
 
 // Fills the fields owned by this module (guest wait, PM4 waits, ring, signals,

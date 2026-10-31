@@ -24,6 +24,9 @@ struct ShaderMetadata
     std::vector<uint32_t> textureDimensions;
     std::vector<uint32_t> aluConsts;
     std::vector<ShaderAttributeMetadata> attributes;
+    // Pixel shader input registers (each read through TEXCOORD<n>). Optional in
+    // the sidecar; empty when absent.
+    std::vector<uint32_t> interpolators;
     bool aluDynamic = false;
 };
 

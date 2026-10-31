@@ -146,6 +146,9 @@ bool ParseShaderMetadata(std::string_view text, uint32_t expectedType,
             parsed.textureSlots.size() != parsed.textureDimensions.size() ||
             !ReadAttributes(root, shaderKind == "vs", parsed.attributes))
             return false;
+        if (root.contains("interpolators") &&
+            !ReadUintArray(root, "interpolators", parsed.interpolators))
+            return false;
         parsed.aluDynamic = dynamic->get<bool>();
         out = std::move(parsed);
         return true;
