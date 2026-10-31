@@ -530,6 +530,7 @@ bool ApplyEnvironmentOverrides(RuntimeConfig& config, std::string& error)
         !ApplyEnvString("MOJORECOMP_TEXTURE_FILTERING", ParseTextureFiltering,
                         config.textureFiltering, error) ||
         !ApplyEnvString("MOJORECOMP_MOTION_BLUR", ParseBool, config.motionBlur, error) ||
+        !ApplyEnvString("MOJORECOMP_DEPTH_OF_FIELD", ParseBool, config.depthOfField, error) ||
         !ApplyEnvString("MOJORECOMP_UPSCALER", ParseUpscaler, config.upscaler, error) ||
         !ApplyEnvString("MOJORECOMP_FSR_SHARPNESS", ParseFsrSharpness,
                         config.fsrSharpness, error) ||

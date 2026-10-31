@@ -9834,12 +9834,61 @@ void RecordPostProcessPass(VkImageView view, VkExtent2D renderArea, const VkRect
     p_vkCmdEndRendering(g_commandBuffer);
 }
 
+// In-game A/B: F5 cycles the upscaler (bilinear, fsr1, rcas) and F8 the FSR
+// sharpness (0.2, 0.5, 0.8, 1.0), starting from the configuration. Only the
+// presenter thread reads and writes these; each change is logged.
+int g_upscalerHotkey = -1;
+float g_fsrSharpnessHotkey = -1.0f;
+
+void PollPresentationHotkeys()
+{
+    static bool f5WasDown = false;
+    static bool f8WasDown = false;
+    const bool f5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+    const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const auto& config = mojorecomp::config::Get();
+    bool changed = false;
+    if (f5 && !f5WasDown)
+    {
+        const int current = g_upscalerHotkey < 0 ? int(config.upscaler) : g_upscalerHotkey;
+        g_upscalerHotkey = (current + 1) % 3;
+        changed = true;
+    }
+    if (f8 && !f8WasDown)
+    {
+        constexpr float kSteps[] = {0.2f, 0.5f, 0.8f, 1.0f};
+        const float current = g_fsrSharpnessHotkey < 0.0f ? config.fsrSharpness
+                                                          : g_fsrSharpnessHotkey;
+        float next = kSteps[0];
+        for (float step : kSteps)
+            if (step > current + 0.01f)
+            {
+                next = step;
+                break;
+            }
+        g_fsrSharpnessHotkey = next;
+        changed = true;
+    }
+    f5WasDown = f5;
+    f8WasDown = f8;
+    if (changed)
+        KLOG("[hotkey] upscaler=%s fsr_sharpness=%.2f (F5 upscaler, F8 sharpness)\n",
+             mojorecomp::config::ToString(static_cast<mojorecomp::config::Upscaler>(
+                 g_upscalerHotkey < 0 ? int(config.upscaler) : g_upscalerHotkey)),
+             static_cast<double>(g_fsrSharpnessHotkey < 0.0f ? config.fsrSharpness
+                                                             : g_fsrSharpnessHotkey));
+}
+
 bool DrawFsrPresentation(uint32_t imageIndex, VkImage sourceImage,
                          uint32_t sourceWidth, uint32_t sourceHeight,
                          bool preserveNative16x9)
 {
     namespace fsr1 = mojorecomp::gpu::fsr1;
-    const auto& config = mojorecomp::config::Get();
+    mojorecomp::config::RuntimeConfig config = mojorecomp::config::Get();
+    if (g_upscalerHotkey >= 0)
+        config.upscaler = static_cast<mojorecomp::config::Upscaler>(g_upscalerHotkey);
+    if (g_fsrSharpnessHotkey >= 0.0f)
+        config.fsrSharpness = g_fsrSharpnessHotkey;
     if (config.upscaler == mojorecomp::config::Upscaler::Bilinear ||
         imageIndex >= g_swapViews.size() || !sourceImage)
         return false;
@@ -15029,6 +15078,7 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
     if (g_outputSuspended)
         return true;
     PollDrawTraceHotkey(g_frames.load(std::memory_order_relaxed) + 1);
+    PollPresentationHotkeys();
     const auto presentStart = PerfClock::now();
     const bool ok = EndFrameAndPresent(frontBuffer, width, height);
     const auto presentEnd = PerfClock::now();

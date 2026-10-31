@@ -818,7 +818,7 @@ int main(int argc, char** argv) {
     // Before the first shader binds. Motion blur off swaps the title's motion
     // blur pass for a one-fetch copy of its source image.
     mojorecomp::gpu::ConfigureTitlePixelShaders(
-        CrashOfTheTitansPixelShaders(), {runtimeConfig.motionBlur, true});
+        CrashOfTheTitansPixelShaders(), {runtimeConfig.motionBlur, runtimeConfig.depthOfField});
     const auto frameRatePolicy = mojorecomp::host::ActiveFrameRatePolicy();
     std::fprintf(stderr,
                  "cot-runtime: frame policy simulation=%uHz presentation=%uHz display=%uHz vblank=%uHz title_patches=%u\n",

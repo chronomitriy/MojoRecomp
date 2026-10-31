@@ -36,8 +36,10 @@ constexpr TitlePixelShader kCrashOfTheTitansPixelShaders[] = {
     // and its first draw.
     {
         0x62F77CF564D38C35ull, "depth-of-field", "DOF.out",
-        PixelShaderRole::DepthOfField, PixelShaderReplacement::ObserveOnly,
-        504, 0, 0,
+        // Drawn in gameplay (the distance blur): 8 depth-weighted taps of s0 around
+        // the centre tap, s0 at TEXCOORD0. Off keeps only the centre tap.
+        PixelShaderRole::DepthOfField, PixelShaderReplacement::Texture0Passthrough,
+        504, Bits({0, 1}), Bits({0, 1}),
     },
 };
 
