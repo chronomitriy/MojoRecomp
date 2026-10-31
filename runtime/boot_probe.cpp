@@ -807,10 +807,11 @@ int main(int argc, char** argv) {
                  runtimeConfig.localizationProfile.c_str(), runtimeConfig.xboxLanguage);
     std::fprintf(stderr,
                  "cot-runtime: graphics resolution_scale=%u anti_aliasing=%s motion_blur=%s "
-                 "upscaler=%s fsr_sharpness=%.2f; profiling guest=%s gpu=%s\n",
+                 "depth_of_field=%s upscaler=%s fsr_sharpness=%.2f; profiling guest=%s gpu=%s\n",
                  runtimeConfig.resolutionScale,
                  mojorecomp::config::ToString(runtimeConfig.antiAliasing),
                  runtimeConfig.motionBlur ? "on" : "off",
+                 runtimeConfig.depthOfField ? "on" : "off",
                  mojorecomp::config::ToString(runtimeConfig.upscaler),
                  static_cast<double>(runtimeConfig.fsrSharpness),
                  mojorecomp::config::ToString(runtimeConfig.guestProfile),

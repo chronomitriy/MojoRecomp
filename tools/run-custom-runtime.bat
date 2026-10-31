@@ -81,7 +81,7 @@ if errorlevel 1 exit /b 1
 >> "%RUNTIME_LOG%" echo game_root=%GAME_ROOT%
 >> "%RUNTIME_LOG%" echo frame_rate=%FRAME_RATE%
 rem Empty means unset: settings.toml, custom-settings.toml or the default applies.
->> "%RUNTIME_LOG%" echo env motion_blur=%MOJORECOMP_MOTION_BLUR% upscaler=%MOJORECOMP_UPSCALER% fsr_sharpness=%MOJORECOMP_FSR_SHARPNESS% guest_profile=%MOJORECOMP_GUEST_PROFILE% gpu_profile=%MOJORECOMP_GPU_PROFILE%
+>> "%RUNTIME_LOG%" echo env motion_blur=%MOJORECOMP_MOTION_BLUR% depth_of_field=%MOJORECOMP_DEPTH_OF_FIELD% upscaler=%MOJORECOMP_UPSCALER% fsr_sharpness=%MOJORECOMP_FSR_SHARPNESS% guest_profile=%MOJORECOMP_GUEST_PROFILE% gpu_profile=%MOJORECOMP_GPU_PROFILE%
 >> "%RUNTIME_LOG%" echo --- runtime output ---
 
 echo Starting the self-built runtime at frame rate %FRAME_RATE%.

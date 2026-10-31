@@ -65,7 +65,7 @@ struct RuntimeConfig {
     // its own fields, so these are also read from custom-settings.toml beside it
     // and from MOJORECOMP_* environment variables. Defaults keep 1.1.0 behaviour.
     bool motionBlur = true;
-    // Distance blur (DOF.out). MOJORECOMP_DEPTH_OF_FIELD=0 only, for now.
+    // Distance blur (DOF.out).
     bool depthOfField = true;
     Upscaler upscaler = Upscaler::Bilinear;
     // 0..1, higher is sharper. RCAS receives 2 * (1 - value) stops.

@@ -80,11 +80,12 @@ int TestPhase4Settings()
     config.antiAliasing = cfg::AntiAliasing::Fxaa;
     config.resolutionScale = 2;
     WriteText(custom, "# local options\n[graphics]\nmotion_blur = false\nupscaler = \"fsr1\"\n"
+                      "depth_of_field = false\n"
                       "fsr_sharpness = 1\n[profiling]\nguest_profile = \"all\"\n"
                       "gpu_profile = true\n");
     if (!cfg::LoadCustomSettingsFile(custom, config, error))
         return Fail(error.c_str());
-    if (config.motionBlur || config.upscaler != cfg::Upscaler::Fsr1 ||
+    if (config.motionBlur || config.depthOfField || config.upscaler != cfg::Upscaler::Fsr1 ||
         config.fsrSharpness != 1.0f ||
         config.guestProfile != cfg::GuestProfileMode::AllThreads || !config.gpuProfile)
         return Fail("custom-settings.toml values were not applied");

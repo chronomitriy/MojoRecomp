@@ -89,6 +89,16 @@ bool ReadGraphicsExtensions(const toml::table& graphics, RuntimeConfig& config,
         }
         config.motionBlur = *value;
     }
+    if (const auto* node = graphics.get("depth_of_field"))
+    {
+        const auto value = node->value<bool>();
+        if (!value || !node->is_boolean())
+        {
+            error = prefix + "graphics.depth_of_field must be true or false";
+            return false;
+        }
+        config.depthOfField = *value;
+    }
     if (const auto* node = graphics.get("upscaler"))
     {
         const auto value = node->value<std::string>();
@@ -480,7 +490,8 @@ bool LoadCustomSettingsFile(const std::filesystem::path& path, RuntimeConfig& co
                 error = "custom-settings: [graphics] must be a table";
                 return false;
             }
-            if (!RejectUnknownKeys(*graphics, {"motion_blur", "upscaler", "fsr_sharpness"},
+            if (!RejectUnknownKeys(*graphics,
+                                   {"motion_blur", "depth_of_field", "upscaler", "fsr_sharpness"},
                                    "custom-settings: [graphics] ", error) ||
                 !ReadGraphicsExtensions(*graphics, updated, "custom-settings", error))
                 return false;
