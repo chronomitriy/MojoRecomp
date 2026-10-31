@@ -1326,6 +1326,9 @@ struct ColorBacking
     VkDescriptorSet transferDescriptor = VK_NULL_HANDLE;
     bool initialized = false;
     bool logicalRaster = false;
+    // Tile rows the surface can cover, from its pass's color/depth layout
+    // (NoteActiveEdramSurfacePair); 0 = unknown, use the frame height.
+    uint32_t edramRowLimit = 0;
     uint64_t lastWriteFrame = 0;
     uint64_t lastWriteDraw = 0;
     uint64_t lastWriteGeneration = 0;
@@ -1355,6 +1358,8 @@ struct DepthBacking
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkDescriptorSet transferDescriptor = VK_NULL_HANDLE;
     bool initialized = false;
+    // See ColorBacking::edramRowLimit.
+    uint32_t edramRowLimit = 0;
 };
 
 std::deque<DepthBacking> g_depthBackings;
@@ -3463,6 +3468,7 @@ struct EdramBackingMeta
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkSampleCountFlagBits guestSamples = VK_SAMPLE_COUNT_1_BIT;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t rowLimit = 0;
 };
 
 bool GetEdramBackingMeta(const EdramOwner& owner, EdramBackingMeta& meta)
@@ -3481,6 +3487,7 @@ bool GetEdramBackingMeta(const EdramOwner& owner, EdramBackingMeta& meta)
         meta.samples = backing->samples;
         meta.guestSamples = GuestEdramSamples(backing->surfaceInfo);
         meta.format = g_swapFormat;
+        meta.rowLimit = backing->edramRowLimit;
         return true;
     }
     if (owner.kind == EdramOwnerKind::Depth)
@@ -3494,6 +3501,7 @@ bool GetEdramBackingMeta(const EdramOwner& owner, EdramBackingMeta& meta)
         meta.samples = backing->samples;
         meta.guestSamples = GuestEdramSamples(backing->surfaceInfo);
         meta.format = backing->format;
+        meta.rowLimit = backing->edramRowLimit;
         return true;
     }
     return false;
@@ -3613,8 +3621,54 @@ uint32_t EdramBackingTileCount(const EdramBackingMeta& meta)
     if (!meta.pitchTiles)
         return 0;
     const uint32_t tileHeight = EdramTileHeightPixels(meta.guestSamples);
-    const uint32_t rows = (g_extent.height + tileHeight - 1u) / tileHeight;
+    uint32_t rows = (g_extent.height + tileHeight - 1u) / tileHeight;
+    if (meta.rowLimit)
+        rows = std::min(rows, meta.rowLimit);
     return std::min<uint32_t>(xenos::kEdramTileCount, meta.pitchTiles * rows);
+}
+
+// Bounds the active color and depth backings by their pass's EDRAM layout
+// (EdramSurfacePairRowLimit). Sized from the 720-line frame alone, the 640-wide
+// 4x MSAA alias of the 1280x720 frame claims 90 tile rows instead of 45, and its
+// depth (at tile 720) wraps past tile 2047: the frame's top 112 rows then go
+// through that depth surface and come back blocky. MOJORECOMP_EDRAM_PAIR_BOUND=0
+// restores the frame-height sizing.
+void NoteActiveEdramSurfacePair()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_EDRAM_PAIR_BOUND");
+        return !(value && value[0] == '0');
+    }();
+    if (!enabled || !g_activeDepthEnabled || g_activeDepthSurfaceKey == UINT64_MAX ||
+        g_activeColorSurfaceKey == UINT64_MAX)
+        return;
+    ColorBacking* color = FindColorBacking(g_activeColorSurfaceKey);
+    DepthBacking* depth = FindDepthBacking(g_activeDepthSurfaceKey);
+    if (!color || !depth)
+        return;
+    const uint32_t rows = mojorecomp::gpu::EdramSurfacePairRowLimit(
+        color->baseTiles, color->pitchTiles, depth->baseTiles, depth->pitchTiles,
+        xenos::kEdramTileCount);
+    if (!rows)
+        return;
+    auto apply = [rows](uint32_t& limit, EdramOwnerKind kind, uint64_t key) {
+        if (limit == rows)
+            return;
+        EdramBackingMeta meta{};
+        const bool known = GetEdramBackingMeta({kind, key}, meta);
+        const uint32_t before = known ? EdramBackingTileCount(meta) : 0;
+        limit = rows;
+        const uint32_t after = known && GetEdramBackingMeta({kind, key}, meta)
+            ? EdramBackingTileCount(meta) : 0;
+        static uint32_t reports = 0;
+        if (after < before && reports++ < 64)
+            KLOG("[edram ownership] surface bounded by its color/depth layout: %s:%016llX "
+                 "tiles %u -> %u (rows %u)\n",
+                 kind == EdramOwnerKind::Color ? "color" : "depth",
+                 static_cast<unsigned long long>(key), before, after, rows);
+    };
+    apply(color->edramRowLimit, EdramOwnerKind::Color, color->key);
+    apply(depth->edramRowLimit, EdramOwnerKind::Depth, depth->key);
 }
 
 bool EnsureEdramTransferInfrastructure()
@@ -4918,6 +4972,21 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
     ++g_perfEdramOwnershipTransfers;
     g_perfEdramOwnershipTiles += tileCount;
     RecordEdramTransferPair(sourceOwner, destOwner, tileCount);
+    // F12 / MOJORECOMP_DRAW_TRACE_FRAME: every transfer of the traced frame,
+    // with its physical tile range, between that frame's draw lines.
+    if (const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
+        TraceDrawFrame(frame))
+        KLOG("[draw frame] frame=%llu edram transfer %s:%016llX base=%03X guest=%ux -> "
+             "%s:%016llX base=%03X guest=%ux pitch=%u local=%u tiles=%u physical=%03X..%03X\n",
+             static_cast<unsigned long long>(frame),
+             source.kind == EdramOwnerKind::Color ? "color" : "depth",
+             static_cast<unsigned long long>(source.key), source.baseTiles,
+             uint32_t(source.guestSamples),
+             dest.kind == EdramOwnerKind::Color ? "color" : "depth",
+             static_cast<unsigned long long>(dest.key), dest.baseTiles,
+             uint32_t(dest.guestSamples), dest.pitchTiles, destLocalStart, tileCount,
+             (dest.baseTiles + destLocalStart) & (xenos::kEdramTileCount - 1u),
+             (dest.baseTiles + destLocalStart + tileCount - 1u) & (xenos::kEdramTileCount - 1u));
     static uint32_t reports = 0;
     if (reports++ < 48)
         KLOG("[edram ownership] transfer src=%s key=%016llX host=%ux guest=%ux -> "
@@ -5041,6 +5110,7 @@ bool DiscardAndClaimEdramOwnership(const EdramOwner& destOwner)
 bool PrepareActiveEdramOwnersForFullOverwrite(bool writeColor0, bool writeColor1,
                                               bool writeDepth)
 {
+    NoteActiveEdramSurfacePair();
     // Match normal ownership precedence: depth first, then color attachments.
     if (writeDepth && g_activeDepthEnabled && g_activeDepthSurfaceKey != UINT64_MAX &&
         !DiscardAndClaimEdramOwnership({EdramOwnerKind::Depth, g_activeDepthSurfaceKey}))
@@ -5085,6 +5155,7 @@ bool PrepareActiveEdramOwnersForWrite(bool writeColor0, bool writeColor1,
                                       bool writeDepth, const char* reason)
 {
     const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
+    NoteActiveEdramSurfacePair();
     const bool haveDepth = writeDepth && g_activeDepthEnabled &&
                            g_activeDepthSurfaceKey != UINT64_MAX;
     const bool haveColor0 = writeColor0 && g_activeColorSurfaceKey != UINT64_MAX;
@@ -14361,6 +14432,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                                   regs[xenos::kRbDepthInfo],
                                   usesDepth, false))
         return false;
+    NoteActiveEdramSurfacePair();
 
     // Host VkImages are only representations of the shared 10 MiB Xenos
     // EDRAM. Make the representation that will actually be written by this

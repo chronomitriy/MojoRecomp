@@ -257,6 +257,50 @@ suspended thread's stack is not lock-free.
   `tools/summarize-runtime-log.py`. `tools/run-custom-runtime.bat` now logs the new
   variables. The FSR license file and notice entries were also added.
 
+### 6.1 Blocky strip at the top of the frame (found in play testing)
+
+In play, a horizontal band at the top of the screen looked low-resolution at 2x, with a
+visible seam just above the health bar. The owner's screenshots showed 38-39 fps on level 1,
+which suggests the official runtime, so the released build very likely has the same bug.
+
+**Cause.** RB_SURFACE_INFO gives a surface's pitch but not its height, and the presenter
+sized every EDRAM surface from the 720-line frame. A one-frame trace (F12) of gameplay at 2x
+showed the game using a 640-wide 4x MSAA alias of its 1280x720 frame (`0A020280`, color at
+tile 0, depth at tile 0x2D0, 16 tiles per row). A 4x tile row is 8 lines, so the alias was
+sized as 90 rows (1,440 tiles) instead of 45 (720). Its depth therefore wrapped past tile
+2047 into tiles 0x000-0x06F, which are the frame color's top 112 rows:
+
+1. a depth-only pass on the alias claimed those tiles and copied the frame's top rows into
+   its depth backing. The host stores guest 4x MSAA as one sample per pixel, and the copy went
+   through the 20e4 depth encoding;
+2. before the scene resolve, the frame color claimed them back, so the top 112 rows returned
+   with one value per 2x2 block. The resolved scene, and the front pass built from it, had a
+   blocky top.
+
+**Fix.** On hardware, one surface pass's color and depth cannot overlap in EDRAM without the
+game corrupting its own frame. `EdramSurfacePairRowLimit` (`gpu/render_policy.h`) turns that
+into a row bound: the color range must end before depth starts, and depth before color
+starts again on the 2,048-tile ring. `NoteActiveEdramSurfacePair` (`gpu/vk_presenter.cpp`)
+applies it to the active color and depth backings before any ownership claim, in the draw
+path and in both resolve-clear paths. `EdramBackingTileCount` uses the smaller of that bound
+and the frame height. Every other surface pair in the traced frame already met the bound and
+keeps its footprint. `MOJORECOMP_EDRAM_PAIR_BOUND=0` restores the old sizing. Each surface
+the bound actually shrinks is logged once as `[edram ownership] surface bounded by its
+color/depth layout`.
+
+**Verified.**
+- `RenderPolicy` unit cases cover the traced layouts, both attachment orders, the ring
+  wrap and 64bpp color.
+- `EdramPairBoundGpuProbe` replays the traced surface registers. It fails with the bound off
+  ("the 4x alias depth must be 720 tiles") and passes with it on. The other GPU probes,
+  including the tiled-resolve ones, pass.
+- In a 2x gameplay run, only `0A020280` color and depth were bounded (1,440 -> 720 tiles).
+  The traced frame had no transfer into 0x000-0x06F involving the alias, and the run held
+  60 fps. The owner confirmed the strip is gone in gameplay.
+
+F12 traces now also log every EDRAM ownership transfer of the traced frame, with its
+physical tile range. Before, only the first 48 transfers of a session were logged.
+
 ## 7. Test on your PC
 
 Build with `build-smoke.bat` (no recompile is needed: `config\` is unchanged). Each run
@@ -369,6 +413,7 @@ phase 2: [HFR-PHASE2.md 9](HFR-PHASE2.md#9-environment-variables); phase 3:
 | `MOJORECOMP_GUEST_PROFILE_INTERVAL_US=100..100000` | 1000 | Sampling interval |
 | `MOJORECOMP_GUEST_PROFILE_REPORT_S=1..3600` | 15 | Report period |
 | `MOJORECOMP_CUSTOM_SETTINGS=<path>` | beside `settings.toml` | Use this `custom-settings.toml`; startup fails if it is missing |
+| `MOJORECOMP_EDRAM_PAIR_BOUND=0` | on | Size EDRAM surfaces from the frame height only (the pre-fix behaviour of [6.1](#61-blocky-strip-at-the-top-of-the-frame-found-in-play-testing)) |
 
 ## 11. Files
 
@@ -380,4 +425,5 @@ phase 2: [HFR-PHASE2.md 9](HFR-PHASE2.md#9-environment-variables); phase 3:
 | GPU timing | `runtime/gpu/gpu_profile.*`, `runtime/gpu/vk_presenter.cpp` |
 | Guest profiler | `runtime/host/guest_profiler.*`, `runtime/kernel/guestcall.h`, `runtime/title_hooks.cpp`, `runtime/guest_native.cpp`, `runtime/cpu/guest_thread.cpp`, `runtime/host/window.*`, `runtime/host/pipeline_metrics.*` |
 | Tests | `runtime/tests/fsr1_test.cpp`, `gpu_profile_test.cpp`, `guest_profiler_test.cpp`, `shader_replacement_test.cpp`, `runtime_config_test.cpp`, `texture_gpu_probe.cpp` (`--fsr-easu`, `--fsr-rcas`) |
-| Tools | `tools/summarize-runtime-log.py`, `tools/run-custom-runtime.bat` |
+| Tools | `tools/summarize-runtime-log.py`, `tools/run-custom-runtime.bat`, `tools/gen_link_stubs.py` |
+| Top strip fix | `runtime/gpu/render_policy.h`, `runtime/gpu/vk_presenter.cpp`, `runtime/tests/render_policy_test.cpp`, `runtime/tests/texture_gpu_probe.cpp` (`--edram-pair-bound`) |

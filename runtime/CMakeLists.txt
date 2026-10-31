@@ -629,6 +629,8 @@ if(BUILD_TESTING AND WIN32)
     set_tests_properties(AuthoredMipGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu")
     add_test(NAME FxaaOrientationGpuProbe COMMAND MojoRecompTextureGpuProbe --fxaa-orientation)
     set_tests_properties(FxaaOrientationGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu;postprocess")
+    add_test(NAME EdramPairBoundGpuProbe COMMAND MojoRecompTextureGpuProbe --edram-pair-bound)
+    set_tests_properties(EdramPairBoundGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu;edram")
     add_test(NAME FsrEasuGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-easu)
     add_test(NAME FsrRcasGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-rcas)
     set_tests_properties(FsrEasuGpuProbe FsrRcasGpuProbe PROPERTIES TIMEOUT 45

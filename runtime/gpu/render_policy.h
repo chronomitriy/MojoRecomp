@@ -50,6 +50,27 @@ inline bool ShouldEnableAnisotropy(
            filteringOverride > 1u && effectiveAnisotropy > 1.0f;
 }
 
+// RB_SURFACE_INFO gives a surface's pitch but not its height. One surface
+// pass renders the same rows into its color and its depth, and on hardware
+// those two ranges cannot overlap on the EDRAM ring without the game
+// corrupting its own frame. That bounds the rows: the color range must end
+// before depth starts and the depth range before color starts again. Returns 0
+// (no bound) when the bases are equal or a pitch is 0.
+inline uint32_t EdramSurfacePairRowLimit(uint32_t colorBaseTiles, uint32_t colorPitchTiles,
+                                         uint32_t depthBaseTiles, uint32_t depthPitchTiles,
+                                         uint32_t edramTiles)
+{
+    if (!colorPitchTiles || !depthPitchTiles || !edramTiles ||
+        (edramTiles & (edramTiles - 1u)) != 0)
+        return 0;
+    const uint32_t mask = edramTiles - 1u;
+    const uint32_t colorToDepth = (depthBaseTiles - colorBaseTiles) & mask;
+    const uint32_t depthToColor = (colorBaseTiles - depthBaseTiles) & mask;
+    if (!colorToDepth)
+        return 0;
+    return std::min(colorToDepth / colorPitchTiles, depthToColor / depthPitchTiles);
+}
+
 inline bool HasRecentPhysicalTileContent(uint64_t currentFrame,
                                          uint64_t lastPhysicalTileFrame)
 {

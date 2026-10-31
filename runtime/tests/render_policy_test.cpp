@@ -88,6 +88,28 @@ int main()
             return Fail("fixed-function EDRAM stencil reconstruction lost bits");
     }
 
+    // Color/depth layouts seen in COT gameplay. The 640-wide 4x MSAA alias of
+    // the 1280x720 frame (color 0, depth 0x2D0, 16 tiles per row) is 45 tile
+    // rows; sizing it from the 720-line frame (90 rows of 8 lines) made its
+    // depth wrap past tile 2047 into the frame's top 112 rows.
+    using mojorecomp::gpu::EdramSurfacePairRowLimit;
+    if (EdramSurfacePairRowLimit(0x000, 16, 0x2D0, 16, 2048) != 45)
+        return Fail("the 4x alias of the 1280x720 frame must be bounded to 45 tile rows");
+    if (EdramSurfacePairRowLimit(0x000, 6, 0x21C, 6, 2048) != 90 ||
+        EdramSurfacePairRowLimit(0x000, 16, 0x2D0, 16, 2048) * 16 != 720)
+        return Fail("existing 2x scene and 1x frame footprints must be unchanged");
+    if (EdramSurfacePairRowLimit(0x438, 6, 0x438, 6, 2048) != 0 ||
+        EdramSurfacePairRowLimit(0x000, 0, 0x2D0, 16, 2048) != 0 ||
+        EdramSurfacePairRowLimit(0x000, 16, 0x2D0, 16, 2000) != 0)
+        return Fail("equal bases, a zero pitch or a bad EDRAM size must not bound rows");
+    // Depth before color, and a pair that straddles the end of the ring.
+    if (EdramSurfacePairRowLimit(0x2D0, 16, 0x000, 16, 2048) != 45 ||
+        EdramSurfacePairRowLimit(1900, 16, 100, 16, 2048) != 15)
+        return Fail("the bound must hold in both orders and across the ring's end");
+    // A 64bpp color target uses twice the tiles per row of its depth.
+    if (EdramSurfacePairRowLimit(0x000, 32, 0x400, 16, 2048) != 32)
+        return Fail("each attachment's own pitch must be used");
+
     VulkanAdapterCapabilities compatible{};
     compatible.graphicsPresent = true;
     compatible.swapchain = true;

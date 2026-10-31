@@ -273,6 +273,57 @@ static void CheckFxaaOrientation(const std::filesystem::path& capturePath,
                   : "PASS: FXAA preserves top-to-bottom presentation orientation");
 }
 
+// Regression for the blocky strip at the top of the frame: the EDRAM layout of
+// a traced COT gameplay frame, as register values only. The 1280x720 frame
+// has color at tile 0 and depth at 0x2D0; its 640-wide 4x MSAA alias uses the
+// same bases. Sized from the 720-line frame, the alias's depth claimed 1440
+// tiles and wrapped past tile 2047 into the frame's first 112 color tiles.
+static void CheckEdramSurfacePairBound()
+{
+    mojorecomp::config::Set(mojorecomp::config::RuntimeConfig{});
+    Require(HostWindow_Init(1280, 720, true), "hidden EDRAM window");
+    Require(VkPresenter_Init(HostWindow_NativeHandle(), 1280, 720), "EDRAM presenter init");
+    Require(BeginFrame(), "begin EDRAM frame");
+
+    Require(SwitchActiveColorSurfaces(0x14000500u, 0x00000000u, 0, false, false) &&
+                SwitchActiveDepthSurface(0x14000500u, 0x000102D0u, true, false),
+            "select the 1280x720 frame");
+    NoteActiveEdramSurfacePair();
+    const EdramOwner frameColor{EdramOwnerKind::Color, g_activeColorSurfaceKey};
+    EdramBackingMeta meta{};
+    Require(GetEdramBackingMeta(frameColor, meta) && EdramBackingTileCount(meta) == 720,
+            "the 1280x720 frame color must stay 720 tiles");
+    Require(ClaimEdramOwnership(frameColor), "claim the frame color");
+
+    Require(SwitchActiveColorSurfaces(0x0A020280u, 0x00000000u, 0, false, false) &&
+                SwitchActiveDepthSurface(0x0A020280u, 0x000102D0u, true, false),
+            "select the 4x MSAA alias");
+    NoteActiveEdramSurfacePair();
+    const EdramOwner aliasDepth{EdramOwnerKind::Depth, g_activeDepthSurfaceKey};
+    Require(GetEdramBackingMeta(aliasDepth, meta) && EdramBackingTileCount(meta) == 720,
+            "the 4x alias depth must be 720 tiles (45 rows of 16)");
+    Require(ClaimEdramOwnership(aliasDepth), "claim the alias depth");
+    for (uint32_t tile = 0; tile < 720; ++tile)
+        Require(EdramOwnerEqual(g_edramOwners[tile], frameColor),
+                "the alias depth must not take the frame color's tiles");
+    for (uint32_t tile = 720; tile < 1440; ++tile)
+        Require(EdramOwnerEqual(g_edramOwners[tile], aliasDepth),
+                "the alias depth must own its own 720 tiles");
+
+    EndColorRendering();
+    Require(p_vkEndCommandBuffer(g_commandBuffer) == VK_SUCCESS, "end EDRAM commands");
+    Require(p_vkResetFences(g_device, 1, &g_fence) == VK_SUCCESS, "reset EDRAM fence");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_commandBuffer;
+    Require(p_vkQueueSubmit(g_queue, 1, &submit, g_fence) == VK_SUCCESS, "submit EDRAM probe");
+    Require(p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 10000000000ull) == VK_SUCCESS,
+            "wait EDRAM probe");
+    g_frameOpen = false;
+    VkPresenter_Shutdown();
+    std::puts("PASS: a 4x MSAA alias stays within its color/depth EDRAM layout");
+}
+
 static void CheckPixels(bool dummy, bool rectangle = false, bool tiledResolve = false)
 {
     EndColorRendering();
@@ -662,6 +713,11 @@ int main(int argc, char** argv)
                                  std::string_view(argv[1]) == "--fsr-easu"
                                      ? PresentationProbe::FsrEasu
                                      : PresentationProbe::FsrRcasOnly);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--edram-pair-bound")
+        {
+            CheckEdramSurfacePairBound();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resolve-rect-cpu")
