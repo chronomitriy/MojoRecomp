@@ -640,6 +640,12 @@ if(BUILD_TESTING AND WIN32)
         COMMAND MojoRecompTextureGpuProbe --edram-stencil-copy 2)
     set_tests_properties(EdramStencilCopyGpuProbe EdramStencilCopyScale2GpuProbe PROPERTIES
         TIMEOUT 120 LABELS "gpu;edram")
+    add_test(NAME EdramAliasRedirectGpuProbe
+        COMMAND MojoRecompTextureGpuProbe --edram-alias-redirect 1)
+    add_test(NAME EdramAliasRedirectScale2GpuProbe
+        COMMAND MojoRecompTextureGpuProbe --edram-alias-redirect 2)
+    set_tests_properties(EdramAliasRedirectGpuProbe EdramAliasRedirectScale2GpuProbe PROPERTIES
+        TIMEOUT 60 LABELS "gpu;edram")
     add_test(NAME FsrEasuGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-easu)
     add_test(NAME FsrRcasGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-rcas)
     set_tests_properties(FsrEasuGpuProbe FsrRcasGpuProbe PROPERTIES TIMEOUT 45

@@ -39,6 +39,8 @@ constexpr uint32_t kVgtEventInitiator = 0x21F9;
 constexpr uint32_t kRbDepthControl = 0x2200;
 constexpr uint32_t kRbBlendControl0 = 0x2201;
 constexpr uint32_t kRbColorControl = 0x2202;
+// SQ_PROGRAM_CNTL; bit 18 (PARAM_GEN) feeds the screen position to the PS.
+constexpr uint32_t kSqProgramCntl = 0x2180;
 constexpr uint32_t kPaClClipCntl = 0x2204;
 constexpr uint32_t kPaSuScModeCntl = 0x2205;
 constexpr uint32_t kPaClVteCntl = 0x2206;

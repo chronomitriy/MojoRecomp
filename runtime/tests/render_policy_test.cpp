@@ -110,6 +110,19 @@ int main()
     if (EdramSurfacePairRowLimit(0x000, 32, 0x400, 16, 2048) != 32)
         return Fail("each attachment's own pitch must be used");
 
+    // MSAA aliases: COT's 240-wide 4x view of the 480-wide 2x scene and the
+    // 640-wide 4x view of the 1280-wide 1x frame (both 6 or 16 tiles per row).
+    using mojorecomp::gpu::EdramAliasPixelScale;
+    const auto scale4xTo2x = EdramAliasPixelScale(4, 6, 2, 6);
+    const auto scale4xTo1x = EdramAliasPixelScale(4, 16, 1, 16);
+    const auto scale2xTo1x = EdramAliasPixelScale(2, 16, 1, 16);
+    if (scale4xTo2x.x != 2 || scale4xTo2x.y != 1 || scale4xTo1x.x != 2 ||
+        scale4xTo1x.y != 2 || scale2xTo1x.x != 1 || scale2xTo1x.y != 2)
+        return Fail("an MSAA alias pixel must span the owner pixels holding its samples");
+    if (EdramAliasPixelScale(2, 6, 4, 6).x != 0 || EdramAliasPixelScale(2, 6, 2, 6).x != 0 ||
+        EdramAliasPixelScale(4, 6, 2, 12).x != 0 || EdramAliasPixelScale(4, 0, 2, 0).x != 0)
+        return Fail("only a higher MSAA mode with the same tile pitch is an alias");
+
     VulkanAdapterCapabilities compatible{};
     compatible.graphicsPresent = true;
     compatible.swapchain = true;

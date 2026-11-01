@@ -53,6 +53,8 @@ struct GpuProfileCounts
     uint32_t transfers = 0;
     // Transfers into a depth target (a subset of transfers).
     uint32_t depthTransfers = 0;
+    // Draws through an MSAA alias drawn into the surface owning its tiles.
+    uint32_t aliasRedirects = 0;
     uint32_t clears = 0;
     uint32_t copies = 0;
     uint32_t draws = 0;
@@ -102,6 +104,7 @@ private:
     uint64_t resolves_ = 0;
     uint64_t transfers_ = 0;
     uint64_t depthTransfers_ = 0;
+    uint64_t aliasRedirects_ = 0;
     uint64_t clears_ = 0;
     uint64_t copies_ = 0;
     uint64_t draws_ = 0;

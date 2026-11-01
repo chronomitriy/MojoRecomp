@@ -606,6 +606,206 @@ static void CheckEdramStencilCopy(uint32_t scale)
                 "(scale %u)\n", scale);
 }
 
+// Which draws FindEdramAliasRedirect sends to the surface owning the tiles.
+static void CheckEdramAliasRedirectDecision()
+{
+    constexpr uint32_t scene2x = 0x078101E0u, alias4x = 0x03C200F0u;
+    constexpr uint32_t frame1x = 0x14000500u, frameAlias4x = 0x0A020280u;
+    const auto ownerKey = [](uint32_t surface, uint32_t info) {
+        return (uint64_t(surface) << 32) | info;
+    };
+    for (auto& owner : g_edramOwners)
+        owner = {};
+    g_edramOwners[0x000] = {EdramOwnerKind::Color, ownerKey(scene2x, 0x00000000u)};
+    g_edramOwners[0x21C] = {EdramOwnerKind::Depth, ownerKey(scene2x, 0x0001021Cu)};
+    g_edramOwners[0x438] = {EdramOwnerKind::Color, ownerKey(scene2x, 0x00000438u)};
+
+    std::vector<uint32_t> regs(0x5000);
+    regs[xenos::kRbSurfaceInfo] = alias4x;
+    regs[xenos::kRbColorInfo] = 0x00000000u;
+    regs[xenos::kRbDepthInfo] = 0x0001021Cu;
+    Pm4Draw draw{};
+    draw.primType = xenos::kRectangleList;
+    ShaderModuleRec ps{};
+    EdramAliasRedirect redirect{};
+    const auto decide = [&](bool executePs, bool color0, bool depth) {
+        redirect = {};
+        return FindEdramAliasRedirect(regs.data(), draw, ps, executePs, color0, false, depth,
+                                      redirect) == EdramAliasRefusal::None;
+    };
+
+    // The scene-tile clear: a color and depth rectangle through the 4x view.
+    Require(decide(true, true, true) && redirect.surfaceInfo == scene2x &&
+                redirect.scaleX == 2 && redirect.scaleY == 1,
+            "a clear through the 4x view of the 2x scene must be redirected 2x1");
+    Require(decide(false, false, true), "a depth-only (stencil) clear must be redirected");
+    Require(!decide(true, false, false), "a draw touching no attachment must not be redirected");
+
+    ps.usesTextures = true;
+    Require(!decide(true, true, true), "a textured pixel shader must not be redirected");
+    Require(decide(false, false, true), "an unexecuted textured pixel shader does not matter");
+    ps.usesTextures = false;
+    ps.writesDepth = true;
+    Require(decide(true, true, true),
+            "the host float24 depth conversion alone must still be redirected");
+    ps.exportsDepth = true;
+    Require(!decide(true, true, true), "a guest depth export must not be redirected");
+    ps.writesDepth = ps.exportsDepth = false;
+    regs[xenos::kSqProgramCntl] = 1u << 18;
+    Require(!decide(true, true, true), "the screen-position input must not be redirected");
+    regs[xenos::kSqProgramCntl] = 0;
+    regs[xenos::kRbColorControl] = 0x10u;
+    Require(!decide(true, true, true), "alpha-to-coverage must not be redirected");
+    regs[xenos::kRbColorControl] = 0;
+    draw.primType = xenos::kTriangleList;
+    Require(!decide(true, true, true), "only rectangle lists are redirected");
+    draw.primType = xenos::kRectangleList;
+
+    // RT1 cleared through the alias's depth: its tiles hold color, so the
+    // depth writes need a real format change.
+    regs[xenos::kRbDepthInfo] = 0x00000438u;
+    Require(!decide(false, false, true), "depth over a color owner must not be redirected");
+    regs[xenos::kRbDepthInfo] = 0x0001021Cu;
+    g_edramOwners[0x000] = {EdramOwnerKind::Color, ownerKey(alias4x, 0x00000000u)};
+    Require(!decide(true, true, true), "color and depth in different surfaces must not be redirected");
+    Require(!decide(true, true, false), "a surface that already owns its tiles is not an alias");
+    g_edramOwners[0x000] = {EdramOwnerKind::Color, ownerKey(scene2x, 0x00000000u)};
+    regs[xenos::kRbSurfaceInfo] = 0x000001E0u;  // 1x view of the same tiles
+    Require(!decide(true, true, true), "a lower MSAA mode is not an alias");
+    regs[xenos::kRbSurfaceInfo] = alias4x;
+
+    // The frame's 4x view, as in the 1280x720 post-processing clears.
+    g_edramOwners[0x2D0] = {EdramOwnerKind::Depth, ownerKey(frame1x, 0x000102D0u)};
+    regs[xenos::kRbSurfaceInfo] = frameAlias4x;
+    regs[xenos::kRbDepthInfo] = 0x000102D0u;
+    Require(decide(false, false, true) && redirect.surfaceInfo == frame1x &&
+                redirect.scaleX == 2 && redirect.scaleY == 2,
+            "a clear through the 4x view of the 1x frame must be redirected 2x2");
+    for (auto& owner : g_edramOwners)
+        owner = {};
+    std::puts("PASS: MSAA alias redirect decisions");
+}
+
+// The redirect's pixel scale checked against the transfer shaders' EDRAM
+// mapping: a constant written into an alias rectangle and transferred back
+// must land exactly on the owner rectangle the redirect draws.
+static void CheckEdramAliasMapping(uint32_t scale)
+{
+    mojorecomp::config::RuntimeConfig config{};
+    config.resolutionScale = scale;
+    mojorecomp::config::Set(config);
+    Require(HostWindow_Init(1280, 720, true), "hidden alias window");
+    Require(VkPresenter_Init(HostWindow_NativeHandle(), 1280, 720), "alias presenter");
+    const uint32_t width = g_internalExtent.width;
+    const uint32_t height = g_internalExtent.height;
+    const VkDeviceSize pixels = VkDeviceSize(width) * height;
+    ProbeBuffer buffer = CreateProbeBuffer(16 * pixels);
+    auto* words = reinterpret_cast<uint32_t*>(buffer.mapped);
+    constexpr uint32_t kConstant = 0xA5C3E1F0u;
+    for (VkDeviceSize i = 0; i < pixels; ++i)
+    {
+        words[i] = (uint32_t(i) * 0x9E3779B1u) | 1u;  // never kConstant
+        words[pixels + i] = kConstant;
+    }
+
+    struct AliasCase
+    {
+        const char* name;
+        uint32_t owner;
+        uint32_t alias;
+        uint32_t tiles;
+        VkRect2D aliasRect;
+    };
+    static constexpr AliasCase kCases[] = {
+        {"4x view of the 2x scene", 0x078101E0u, 0x03C200F0u, 540, {{40, 16}, {120, 64}}},
+        {"4x view of the 1x frame", 0x14000500u, 0x0A020280u, 720, {{80, 8}, {160, 40}}},
+    };
+    for (const AliasCase& c : kCases)
+    {
+        const auto pixelScale = mojorecomp::gpu::EdramAliasPixelScale(
+            1u << uint32_t(xenos::SurfaceMsaaSamples(c.alias)),
+            xenos::SurfacePitchTiles(c.alias, false),
+            1u << uint32_t(xenos::SurfaceMsaaSamples(c.owner)),
+            xenos::SurfacePitchTiles(c.owner, false));
+        Require(pixelScale.x != 0, c.name);
+        ColorBacking* backing = nullptr;
+        Require(CreateColorBacking(c.owner, 0, backing) && CreateColorBacking(c.alias, 0, backing),
+                c.name);
+        const uint64_t ownerKey = ColorSurfaceKey(c.owner, 0);
+        const uint64_t aliasKey = ColorSurfaceKey(c.alias, 0);
+        const auto copyWords = [&](uint64_t key, VkDeviceSize offset, VkRect2D logical,
+                                   bool toImage) {
+            ColorBacking* image = FindColorBacking(key);
+            Require(image != nullptr, c.name);
+            TransitionColorBacking(*image, toImage ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                                   : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            const VkRect2D host = ScaleRectToInternal(logical);
+            VkBufferImageCopy region{};
+            region.bufferOffset = offset + (VkDeviceSize(host.offset.y) * width +
+                                            VkDeviceSize(host.offset.x)) * 4u;
+            region.bufferRowLength = width;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageOffset = {host.offset.x, host.offset.y, 0};
+            region.imageExtent = {host.extent.width, host.extent.height, 1};
+            if (toImage)
+                p_vkCmdCopyBufferToImage(g_commandBuffer, buffer.buffer, image->image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            else
+                p_vkCmdCopyImageToBuffer(g_commandBuffer, image->image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
+                                         &region);
+        };
+        const VkRect2D full{{0, 0}, {1280, 720}};
+        const VkDeviceSize viaTransfer = 8 * pixels, viaRedirect = 12 * pixels;
+        const VkRect2D ownerRect{{c.aliasRect.offset.x * int32_t(pixelScale.x),
+                                  c.aliasRect.offset.y * int32_t(pixelScale.y)},
+                                 {c.aliasRect.extent.width * pixelScale.x,
+                                  c.aliasRect.extent.height * pixelScale.y}};
+
+        Require(BeginFrame(), c.name);
+        // Through the alias: owner -> alias, constant rectangle, alias -> owner.
+        copyWords(ownerKey, 0, full, true);
+        Require(TransferEdramOwnershipSpan({EdramOwnerKind::Color, ownerKey},
+                                           {EdramOwnerKind::Color, aliasKey}, 0, c.tiles),
+                c.name);
+        copyWords(aliasKey, 4 * pixels, c.aliasRect, true);
+        Require(TransferEdramOwnershipSpan({EdramOwnerKind::Color, aliasKey},
+                                           {EdramOwnerKind::Color, ownerKey}, 0, c.tiles),
+                c.name);
+        copyWords(ownerKey, viaTransfer, full, false);
+        // Redirected: the constant rectangle written straight into the owner.
+        copyWords(ownerKey, 0, full, true);
+        copyWords(ownerKey, 4 * pixels, ownerRect, true);
+        copyWords(ownerKey, viaRedirect, full, false);
+        SubmitProbeFrame(c.name);
+
+        uint64_t constantPixels = 0;
+        for (VkDeviceSize i = 0; i < pixels; ++i)
+        {
+            const bool transferred = words[viaTransfer / 4 + i] == kConstant;
+            const bool redirected = words[viaRedirect / 4 + i] == kConstant;
+            if (transferred != redirected)
+            {
+                std::fprintf(stderr, "%s: pixel %llu,%llu transfer=%d redirect=%d\n", c.name,
+                             static_cast<unsigned long long>(i % width),
+                             static_cast<unsigned long long>(i / width), int(transferred),
+                             int(redirected));
+                Require(false, "the redirect must write the samples the alias writes");
+            }
+            constantPixels += redirected;
+        }
+        Require(constantPixels == VkDeviceSize(ownerRect.extent.width) * ownerRect.extent.height *
+                                      scale * scale,
+                "the redirected rectangle must cover exactly the scaled alias rectangle");
+        std::printf("  ok: %s (scale %u, alias %ux%u px -> owner %ux%u px)\n", c.name, scale,
+                    c.aliasRect.extent.width, c.aliasRect.extent.height,
+                    ownerRect.extent.width, ownerRect.extent.height);
+    }
+    DestroyProbeBuffer(buffer);
+    VkPresenter_Shutdown();
+    std::printf("PASS: MSAA alias pixels map to the scaled owner rectangle (scale %u)\n", scale);
+}
+
 // Informational (not a CTest): GPU time of a 540-tile depth transfer at scale 2,
 // with the stencil bit planes and with the compute stencil copy.
 static void BenchEdramStencilCopy()
@@ -1060,6 +1260,12 @@ int main(int argc, char** argv)
         if (argc == 2 && std::string_view(argv[1]) == "--edram-pair-bound")
         {
             CheckEdramSurfacePairBound();
+            return 0;
+        }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--edram-alias-redirect")
+        {
+            CheckEdramAliasRedirectDecision();
+            CheckEdramAliasMapping(argc == 3 ? uint32_t(std::stoul(argv[2])) : 1u);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--edram-stencil-copy-bench")

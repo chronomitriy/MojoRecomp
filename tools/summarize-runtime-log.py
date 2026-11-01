@@ -36,7 +36,7 @@ POLICY_RE = re.compile(r"frame policy simulation=(?P<sim>\d+)Hz presentation=(?P
 GRAPHICS_RE = re.compile(r"cot-runtime: (?P<text>graphics resolution_scale=.*)$")
 PS_REPLACE_RE = re.compile(r"\[ps-replace\] (?P<text>.*)$")
 FSR_RE = re.compile(r"(?P<text>Vulkan FSR (active|shader compile failed): .*)$")
-STENCIL_RE = re.compile(r"(?P<text>Vulkan EDRAM depth transfer (stencil|fallback active): .*)$")
+STENCIL_RE = re.compile(r"(?P<text>Vulkan EDRAM (depth transfer (stencil|fallback active)|alias redirect (active|refused \(.*\))): .*)$")
 GPU_PROFILE_RE = re.compile(r"\[gpu-profile\] frames=\d+ gpu=(?P<gpu>[\d.]+)ms "
                             r"max=(?P<max>[\d.]+)ms \|(?P<categories>[^|]*)\| per frame: "
                             r"(?P<counts>.*?) overflow=(?P<overflow>\d+) malformed=(?P<malformed>\d+)")

@@ -1584,6 +1584,9 @@ struct ShaderModuleRec
     bool usesAlu = true;
     uint32_t colorOutputMask = 0;
     bool writesDepth = false;
+    // The guest shader exports depth itself (not only the host's optional
+    // float24 conversion of the rasterized depth, which also sets writesDepth).
+    bool exportsDepth = false;
     // AttributeLayoutHash(*this), fixed once the metadata is populated.
     uint64_t attributeLayoutHash = 0;
 };
@@ -11068,6 +11071,11 @@ bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
         return true;
 
     rec.writesDepth = translated.hlsl.find("SV_Depth") != std::string::npos;
+    // XenosRecomp declares a guest depth export unconditionally and the host
+    // float24 conversion inside #ifdef MOJORECOMP_FLOAT24_DEPTH.
+    rec.exportsDepth = rec.writesDepth &&
+        translated.hlsl.find("#ifdef MOJORECOMP_FLOAT24_DEPTH\n,\n\tout float oDepth : SV_Depth") ==
+            std::string::npos;
     for (uint32_t target = 0; target < 4; ++target)
     {
         const std::string semantic = "SV_Target" + std::to_string(target);
@@ -14146,6 +14154,125 @@ bool VkPresenter_ValidateConfiguredPostProcess()
     return EnsureFxaaResources();
 }
 
+// A rectangle drawn through a higher-MSAA alias of a surface that owns the
+// alias's tiles: D3D's fast clears clear most of a 2x scene tile through a 4x
+// view with half the pixels (and the 1x frame through a 4x view with a
+// quarter). Drawing it into the owner, scaled by EdramAliasPixelScale, writes
+// the same samples without moving the whole surface to the alias and back.
+// Only for output that cannot vary inside an alias pixel's footprint:
+// rectangle lists without pixel-shader textures, shader depth, the screen
+// position input or alpha-to-coverage. MOJORECOMP_EDRAM_ALIAS_REDIRECT=0
+// turns it off.
+struct EdramAliasRedirect
+{
+    uint32_t surfaceInfo = 0;
+    uint32_t scaleX = 1;
+    uint32_t scaleY = 1;
+};
+
+// Why FindEdramAliasRedirect left a draw alone. From PixelShaderTextures on,
+// the draw is a rectangle through an MSAA view that could otherwise be
+// redirected.
+enum class EdramAliasRefusal : uint8_t
+{
+    None,
+    Off,
+    NotRectangleList,
+    NoAliasOwner,
+    PixelShaderTextures,
+    PixelShaderDepth,
+    ScreenPosition,
+    AlphaToMask,
+    Count,
+};
+
+const char* ToString(EdramAliasRefusal refusal)
+{
+    switch (refusal)
+    {
+        case EdramAliasRefusal::None: return "none";
+        case EdramAliasRefusal::Off: return "off";
+        case EdramAliasRefusal::NotRectangleList: return "not a rectangle list";
+        case EdramAliasRefusal::NoAliasOwner: return "no lower-MSAA owner";
+        case EdramAliasRefusal::PixelShaderTextures: return "pixel-shader textures";
+        case EdramAliasRefusal::PixelShaderDepth: return "pixel-shader depth export";
+        case EdramAliasRefusal::ScreenPosition: return "screen-position input";
+        case EdramAliasRefusal::AlphaToMask: return "alpha to mask";
+        case EdramAliasRefusal::Count: break;
+    }
+    return "?";
+}
+
+bool EdramAliasRedirectEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_EDRAM_ALIAS_REDIRECT");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+EdramAliasRefusal FindEdramAliasRedirect(const uint32_t* regs, const Pm4Draw& draw,
+                                         const ShaderModuleRec& ps, bool executePixelShader,
+                                         bool writesColor0, bool writesColor1, bool usesDepth,
+                                         EdramAliasRedirect& out)
+{
+    if (!EdramAliasRedirectEnabled())
+        return EdramAliasRefusal::Off;
+    if (draw.primType != xenos::kRectangleList)
+        return EdramAliasRefusal::NotRectangleList;
+
+    const uint32_t aliasSurface = regs[xenos::kRbSurfaceInfo];
+    const uint32_t aliasSamples = 1u << uint32_t(xenos::SurfaceMsaaSamples(aliasSurface));
+    uint32_t ownerSurface = 0;
+    bool haveOwner = false;
+    // Every attachment the draw reads or writes must currently live in the
+    // same owner surface, at the alias's base tile, with the alias's format.
+    const auto ownedByAliasOwner = [&](EdramOwnerKind kind, uint32_t info, uint32_t baseTiles,
+                                       bool is64Bpp) {
+        const EdramOwner& owner = g_edramOwners[baseTiles & (xenos::kEdramTileCount - 1u)];
+        if (owner.kind != kind || uint32_t(owner.key) != info)
+            return false;
+        const uint32_t surface = uint32_t(owner.key >> 32);
+        if (surface == aliasSurface || (haveOwner && surface != ownerSurface))
+            return false;
+        const auto scale = mojorecomp::gpu::EdramAliasPixelScale(
+            aliasSamples, xenos::SurfacePitchTiles(aliasSurface, is64Bpp),
+            1u << uint32_t(xenos::SurfaceMsaaSamples(surface)),
+            xenos::SurfacePitchTiles(surface, is64Bpp));
+        if (!scale.x)
+            return false;
+        ownerSurface = surface;
+        haveOwner = true;
+        out.scaleX = scale.x;
+        out.scaleY = scale.y;
+        return true;
+    };
+    const uint32_t depthInfo = regs[xenos::kRbDepthInfo];
+    const uint32_t colorInfo = regs[xenos::kRbColorInfo];
+    const uint32_t color1Info = regs[xenos::kRbColor1Info];
+    if ((usesDepth && !ownedByAliasOwner(EdramOwnerKind::Depth, depthInfo,
+                                         xenos::DepthBaseTiles(depthInfo), false)) ||
+        (writesColor0 && !ownedByAliasOwner(EdramOwnerKind::Color, colorInfo,
+                                            xenos::ColorBaseTiles(colorInfo),
+                                            xenos::ColorFormatIs64Bpp(colorInfo))) ||
+        (writesColor1 && !ownedByAliasOwner(EdramOwnerKind::Color, color1Info,
+                                            xenos::ColorBaseTiles(color1Info),
+                                            xenos::ColorFormatIs64Bpp(color1Info))) ||
+        !haveOwner)
+        return EdramAliasRefusal::NoAliasOwner;
+    if (executePixelShader && ps.usesTextures)
+        return EdramAliasRefusal::PixelShaderTextures;
+    if (executePixelShader && ps.exportsDepth)
+        return EdramAliasRefusal::PixelShaderDepth;
+    if (executePixelShader && (regs[xenos::kSqProgramCntl] & (1u << 18)))
+        return EdramAliasRefusal::ScreenPosition;
+    if (regs[xenos::kRbColorControl] & 0x10u)
+        return EdramAliasRefusal::AlphaToMask;
+    out.surfaceInfo = ownerSurface;
+    return EdramAliasRefusal::None;
+}
+
 bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                        const uint32_t* regs, uint64_t vsHash, uint64_t psHash)
 {
@@ -14841,10 +14968,42 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     // rendering for every draw when the bindings are unchanged; cutscenes can
     // issue hundreds of draws per frame, making that redundant scope churn a
     // significant CPU cost.
-    if (!SwitchActiveColorSurfaces(regs[xenos::kRbSurfaceInfo], regs[xenos::kRbColorInfo],
+    EdramAliasRedirect aliasRedirect{};
+    const EdramAliasRefusal aliasRefusal = FindEdramAliasRedirect(
+        regs, draw, *ps, mode != 5, mode == 4 && (colorMask & 0xFu) != 0,
+        writesRt1 && ((colorMask >> 4) & 0xFu) != 0, usesDepth, aliasRedirect);
+    const bool aliasRedirected = aliasRefusal == EdramAliasRefusal::None;
+    if (aliasRefusal >= EdramAliasRefusal::PixelShaderTextures)
+    {
+        static std::array<bool, size_t(EdramAliasRefusal::Count)> reported{};
+        if (!reported[size_t(aliasRefusal)] || traceDrawFrame)
+            KLOG("Vulkan EDRAM alias redirect refused (%s): frame=%llu surface=%08X PS=%016llX\n",
+                 ToString(aliasRefusal), static_cast<unsigned long long>(diagnosticFrame),
+                 regs[xenos::kRbSurfaceInfo], static_cast<unsigned long long>(psHash));
+        reported[size_t(aliasRefusal)] = true;
+    }
+    const uint32_t surfaceInfo =
+        aliasRedirected ? aliasRedirect.surfaceInfo : regs[xenos::kRbSurfaceInfo];
+    if (aliasRedirected)
+    {
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::aliasRedirects);
+        static bool reported = false;
+        if (!reported)
+        {
+            reported = true;
+            KLOG("Vulkan EDRAM alias redirect active: first draw surface=%08X -> %08X "
+                 "scale=%ux%u\n", regs[xenos::kRbSurfaceInfo], surfaceInfo,
+                 aliasRedirect.scaleX, aliasRedirect.scaleY);
+        }
+        if (traceDrawFrame)
+            KLOG("[draw frame] frame=%llu alias redirect surface=%08X -> %08X scale=%ux%u\n",
+                 static_cast<unsigned long long>(diagnosticFrame), regs[xenos::kRbSurfaceInfo],
+                 surfaceInfo, aliasRedirect.scaleX, aliasRedirect.scaleY);
+    }
+    if (!SwitchActiveColorSurfaces(surfaceInfo, regs[xenos::kRbColorInfo],
                                    regs[xenos::kRbColor1Info], writesRt1, false))
         return false;
-    if (!SwitchActiveDepthSurface(regs[xenos::kRbSurfaceInfo],
+    if (!SwitchActiveDepthSurface(surfaceInfo,
                                   regs[xenos::kRbDepthInfo],
                                   usesDepth, false))
         return false;
@@ -14957,7 +15116,15 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     const bool shaderWritesDepth = executeGuestPixelShader && ps->writesDepth;
     VkViewport logicalViewport =
         DecodeViewport(regs, logicalTileCoordinates, shaderWritesDepth, depthControl);
-    const VkViewport viewport = ScaleViewportToInternal(logicalViewport);
+    VkViewport viewport = ScaleViewportToInternal(logicalViewport);
+    if (aliasRedirected)
+    {
+        // Alias pixels span scaleX x scaleY owner pixels (see FindEdramAliasRedirect).
+        viewport.x *= float(aliasRedirect.scaleX);
+        viewport.width *= float(aliasRedirect.scaleX);
+        viewport.y *= float(aliasRedirect.scaleY);
+        viewport.height *= float(aliasRedirect.scaleY);
+    }
     const uint32_t rasterState = regs[xenos::kPaSuScModeCntl] & 7u;
     const uint32_t colorControl = regs[xenos::kRbColorControl];
     uint32_t alphaTest = 0;
@@ -15087,6 +15254,20 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     VkRect2D scissor = DecodeScissor(regs, false);
     if (!scissor.extent.width || !scissor.extent.height)
         return true;
+    if (aliasRedirected)
+    {
+        const uint32_t x0 = std::min(uint32_t(scissor.offset.x) * aliasRedirect.scaleX,
+                                     g_extent.width);
+        const uint32_t y0 = std::min(uint32_t(scissor.offset.y) * aliasRedirect.scaleY,
+                                     g_extent.height);
+        const uint32_t x1 = std::min((uint32_t(scissor.offset.x) + scissor.extent.width) *
+                                         aliasRedirect.scaleX, g_extent.width);
+        const uint32_t y1 = std::min((uint32_t(scissor.offset.y) + scissor.extent.height) *
+                                         aliasRedirect.scaleY, g_extent.height);
+        scissor = {{int32_t(x0), int32_t(y0)}, {x1 - x0, y1 - y0}};
+        if (!scissor.extent.width || !scissor.extent.height)
+            return true;
+    }
     AccumulatePerfShaderPair(vsHash, psHash, draw.indexed, prepared.count,
                              uint64_t(scissor.extent.width) * scissor.extent.height);
     uint32_t perfStencilFront = 0;

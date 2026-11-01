@@ -183,8 +183,8 @@ ownership transfers (`transfer-color` into color targets, `transfer-depth` for t
 pass of a transfer into a depth target, `transfer-stencil` for its stencil part, see
 [6.2](#62-cheaper-stencil-for-edram-depth-transfers)), `clear`, `copy` (texture uploads),
 `post` (compose + FXAA), `fsr`, `present` and `other`. It also counts render passes,
-resolves, transfers (and `depthTransfers` among them), clears, copies, draws and front-pass
-draws per frame. Logs from before the split have a single `transfer=`;
+resolves, transfers (and `depthTransfers` among them), `aliasRedirects`
+([6.4](#64-msaa-alias-redirect)), clears, copies, draws and front-pass draws per frame. Logs from before the split have a single `transfer=`;
 `summarize-runtime-log.py` prints that total for newer logs too.
 
 Results are read when the frame's fence has signalled, so reading never stalls. Every 120
@@ -339,6 +339,69 @@ must move real scene depth.
   stencil inside them changed. The other 14 texture-probe tests still pass.
 - **Not verified yet:** in-game fps and the new `transfer-stencil` time (the next run).
 
+### 6.4 MSAA alias redirect
+
+After 6.2 the 2x GPU frame was 9.43 ms, still half transfers (4.66 ms, 56 per frame). An F12
+trace shows where most of them come from. At the start of each of the three scene tiles,
+D3D's fast clear clears the 2x scene surface (`078101E0`, 480 wide) mostly through a 4x
+view of the same tiles (`03C200F0`, 240 wide, columns 0-200 = scene columns 0-400). The
+1x frame (`14000500`) is cleared the same way through its 4x view (`0A020280`). Each of
+those rectangles moved the whole surface to the 4x view and back.
+
+Surfaces at the same EDRAM base with the same tile pitch and format but different MSAA
+modes hold the same samples:
+
+- a 4x pixel (x, y) holds 2x pixels (2x, y) and (2x + 1, y);
+- a 4x pixel also holds 1x pixels (2x..2x+1, 2y..2y+1);
+- a 2x pixel (x, y) holds 1x pixels (x, 2y..2y+1).
+
+A draw through the higher-MSAA view is now drawn into the surface that owns its tiles,
+with the viewport and scissor scaled by that factor (`EdramAliasPixelScale`,
+`FindEdramAliasRedirect`).
+
+- **Guard:** a rectangle list; no pixel-shader textures, guest depth export, screen-position
+  input (SQ_PROGRAM_CNTL param_gen) or alpha-to-coverage; every attachment the draw
+  touches is owned, at its base tile, by the same lower-MSAA surface with the same
+  format and tile pitch. Otherwise the normal ownership path runs.
+- **Where it differs from real hardware:** the pixel shader runs at owner-pixel
+  centres, at x+0.25 and x+0.75 of an alias pixel instead of once at x+0.5. Interpolated
+  colors and depth planes that vary across x therefore differ by less than one alias
+  pixel's worth of gradient, and shader derivatives double. COT's clears use the same
+  value at every vertex, and the old host-1x round trip was approximate too.
+- **Not covered by the probes:** the 1x view of a 2x surface (scale 1x2), handled by the
+  same code, and the register guards. The param_gen bit (18) and the SQ_PROGRAM_CNTL
+  address (0x2180) follow Xenia's register layout and were not checked against a local
+  source. Alpha-to-mask (RB_COLORCONTROL bit 4) matches the runtime's alpha-test
+  decoding (bits 0-3).
+- **What stays:** RT1 (tile 0x438) is cleared through the 4x view's *depth*, over tiles
+  that hold color, so those 14 transfers per frame still run.
+- **Accuracy:** at host 1x the old round trip kept one sample per 4x pixel, so every
+  second scene column that the clear did not cover came back as a copy of its
+  neighbour. The redirect leaves those pixels alone.
+- **Off switch:** `MOJORECOMP_EDRAM_ALIAS_REDIRECT=0`.
+- **Log:** `Vulkan EDRAM alias redirect active: first draw surface=... scale=...`; F12 traces
+  add `alias redirect` lines; `MOJORECOMP_GPU_PROFILE` counts `aliasRedirects` per frame.
+- **Tests:** `RenderPolicy` (the pixel scale). `EdramAliasRedirectGpuProbe` and
+  `...Scale2GpuProbe` (`MojoRecompTextureGpuProbe --edram-alias-redirect 1|2`) check the
+  decision cases (redirected and refused). They also check, on the GPU, that a constant
+  written into an alias rectangle and moved back by the transfer shaders lands exactly
+  on the scaled owner rectangle, for both views.
+- **First run (`20261101-0440`, 2x, level 2, 120 mode):** 119.9 fps median (p10 107), GPU
+  9.43 -> 7.68 ms, transfers 56 -> 38. Only the 9 depth-only clears per frame were
+  redirected. The color+depth clears were refused because `writesDepth` is set by a text
+  search for `SV_Depth`, and every translated pixel shader declares it for the host
+  float24 conversion (`#ifdef MOJORECOMP_FLOAT24_DEPTH`; all 18 cached shaders). The guard
+  now uses `exportsDepth`, which is true only for a guest depth export.
+- **Refusals are logged:** a rectangle through an MSAA view that a guard refuses logs
+  `Vulkan EDRAM alias redirect refused (<reason>)` once per reason, and on every F12
+  traced frame.
+- **Second run (`20261101-0453`, 2x, level 2, 162 mode):** 147.7 fps median (p10 117, p90
+  162, a third of the windows at the cap), GPU 6.64 ms (scene 3.12, transfers 1.61,
+  resolve 1.05). 13 redirects and 22 transfers per frame in all four traced frames, no
+  refusals. The owner reported nothing visually wrong. Left: 14 transfers for RT1 at tile
+  0x438 (cleared through the 4x view's depth over a color owner) and 8 swaps between
+  the 1x frame and the 2x scene.
+
 ### 6.3 Indirect-call hook
 
 The guest profiler put `MojoRecompTraceIndirectCall` at about 1% of the main thread. It
@@ -464,6 +527,7 @@ phase 2: [HFR-PHASE2.md 9](HFR-PHASE2.md#9-environment-variables); phase 3:
 | `MOJORECOMP_GUEST_PROFILE_REPORT_S=1..3600` | 15 | Report period |
 | `MOJORECOMP_CUSTOM_SETTINGS=<path>` | beside `settings.toml` | Use this `custom-settings.toml`; startup fails if it is missing |
 | `MOJORECOMP_EDRAM_PAIR_BOUND=0` | on | Size EDRAM surfaces from the frame height only (the pre-fix behaviour of [6.1](#61-blocky-strip-at-the-top-of-the-frame-found-in-play-testing)) |
+| `MOJORECOMP_EDRAM_ALIAS_REDIRECT=0` | on | Move whole surfaces to MSAA views for their clears again instead of drawing into the owner ([6.4](#64-msaa-alias-redirect)) |
 | `MOJORECOMP_EDRAM_STENCIL_COPY=0` | on | Use the eight stencil bit-plane draws instead of the compute stencil copy ([6.2](#62-cheaper-stencil-for-edram-depth-transfers)) |
 
 ## 11. Files

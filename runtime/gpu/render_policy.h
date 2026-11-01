@@ -71,6 +71,33 @@ inline uint32_t EdramSurfacePairRowLimit(uint32_t colorBaseTiles, uint32_t color
     return std::min(colorToDepth / colorPitchTiles, depthToColor / depthPitchTiles);
 }
 
+// Xenos surfaces at the same EDRAM base with the same tile pitch and format
+// but different MSAA modes alias the same samples. In a tile, a 4x pixel
+// (x, y) holds the samples of 2x pixels (2x, y) and (2x + 1, y) and of 1x
+// pixels (2x..2x+1, 2y..2y+1); a 2x pixel (x, y) holds those of 1x pixels
+// (x, 2y..2y+1). Returns how many owner pixels one alias pixel spans on each
+// axis, or {0, 0} when the alias is not a higher MSAA mode of the owner with
+// the same tile pitch. Sample counts are 1, 2 or 4.
+struct EdramAliasScale
+{
+    uint32_t x = 0;
+    uint32_t y = 0;
+};
+
+inline EdramAliasScale EdramAliasPixelScale(uint32_t aliasSamples, uint32_t aliasPitchTiles,
+                                            uint32_t ownerSamples, uint32_t ownerPitchTiles)
+{
+    if (!aliasPitchTiles || aliasPitchTiles != ownerPitchTiles)
+        return {};
+    if (aliasSamples == 4 && ownerSamples == 2)
+        return {2, 1};
+    if (aliasSamples == 4 && ownerSamples == 1)
+        return {2, 2};
+    if (aliasSamples == 2 && ownerSamples == 1)
+        return {1, 2};
+    return {};
+}
+
 inline bool HasRecentPhysicalTileContent(uint64_t currentFrame,
                                          uint64_t lastPhysicalTileFrame)
 {
