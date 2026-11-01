@@ -646,6 +646,12 @@ if(BUILD_TESTING AND WIN32)
         COMMAND MojoRecompTextureGpuProbe --edram-alias-redirect 2)
     set_tests_properties(EdramAliasRedirectGpuProbe EdramAliasRedirectScale2GpuProbe PROPERTIES
         TIMEOUT 60 LABELS "gpu;edram")
+    add_test(NAME EdramDepthAsColorGpuProbe
+        COMMAND MojoRecompTextureGpuProbe --edram-depth-as-color 1)
+    add_test(NAME EdramDepthAsColorScale2GpuProbe
+        COMMAND MojoRecompTextureGpuProbe --edram-depth-as-color 2)
+    set_tests_properties(EdramDepthAsColorGpuProbe EdramDepthAsColorScale2GpuProbe PROPERTIES
+        TIMEOUT 60 LABELS "gpu;edram")
     add_test(NAME FsrEasuGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-easu)
     add_test(NAME FsrRcasGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-rcas)
     set_tests_properties(FsrEasuGpuProbe FsrRcasGpuProbe PROPERTIES TIMEOUT 45

@@ -402,6 +402,56 @@ with the viewport and scissor scaled by that factor (`EdramAliasPixelScale`,
   0x438 (cleared through the 4x view's depth over a color owner) and 8 swaps between
   the 1x frame and the 2x scene.
 
+### 6.5 Depth clears over a color surface, drawn as color
+
+COT clears RT1 (tile 0x438) with depth-only rectangles (mode 5, depth control `0x8777`)
+through the 4x view's *depth*, while those tiles hold the 2x scene's RT1 *color*. Each one
+moved RT1 into the depth view and back: 14 of the 22 transfers per frame left after 6.4,
+7 of them into depth (with the stencil part).
+
+Such a rectangle writes the same 32-bit depth/stencil word to every sample: stencil in
+byte 0, the 24-bit depth (unorm, or 20e4 for D24FS8) above it. The color view of the same
+tile holds that word as RGBA8. So the rectangle is now drawn into the color owner with
+the guest vertex shader and a host pixel shader. The pixel shader writes the word as
+color: R = stencil, G/B/A = depth. It packs it exactly as the transfer shaders do
+(`Float32To20e4`, `UnpackColor`), and the color write mask keeps the parts the clear
+doesn't write.
+
+Color and depth views of a tile swap their two 40-sample halves. So the rectangle is
+drawn twice, shifted by half a tile (40 owner pixels) each way, and each pass keeps one
+half of every tile (`EdramDepthAsColorPasses`). The viewport and scissor are scaled as
+in 6.4.
+
+- **Guard (`FindEdramDepthAsColorClear`):**
+  - a mode-5 rectangle list;
+  - depth test off or ALWAYS;
+  - stencil written only by REPLACE or ZERO under ALWAYS, with a full write mask (or not
+    written at all);
+  - something is written;
+  - the depth's base tile is owned by a 32bpp 8_8_8_8 color surface starting there, of
+    the same or a lower MSAA mode with the same tile pitch.
+
+  The word then doesn't depend on what was there before.
+- **Off switch:** `MOJORECOMP_EDRAM_DEPTH_AS_COLOR=0`. `MOJORECOMP_EDRAM_ALIAS_REDIRECT=0`
+  turns off both 6.4 and this.
+- **Log:** `Vulkan EDRAM depth clear drawn as color: ...`, first time and on F12 traced
+  frames. Each such draw adds to the profile's `aliasRedirects` count.
+- **Tests:** `EdramDepthAsColorGpuProbe` and `...Scale2GpuProbe`
+  (`--edram-depth-as-color 1|2`).
+  - **Decisions:** the cases drawn as color and the cases refused.
+  - **Comparison with the transfer path, in three cases:** COT's tile-aligned depth +
+    stencil clear; a stencil-only clear over partial tiles; a float24 depth-only clear
+    over partial tiles. The new path must write the same bytes over the same pixels,
+    including where the half swap moves them, and leave everything else untouched.
+    Outside the clear the old path isn't a reference: its 4x round trip loses samples.
+  - Both passes and the pixel shader are the runtime's own (`GetEdramDepthAsColorShader`).
+    A host vertex shader stands in for the guest one.
+- **Run (`20261101-0515`, 2x, level 2, 162 mode):** 161.2 fps median (p10 132, 231 of 443
+  windows at the cap), GPU 6.64 -> 5.75 ms (transfers 1.61 -> 0.55). Transfers went from
+  22 to 8 per frame (4 into depth), and `aliasRedirects` from 13 to 20. Both traced
+  frames have 7 clears drawn as color and no refusals. The 8 transfers left are the
+  per-frame swaps between the 1x frame and the 2x scene.
+
 ### 6.3 Indirect-call hook
 
 The guest profiler put `MojoRecompTraceIndirectCall` at about 1% of the main thread. It
@@ -528,6 +578,7 @@ phase 2: [HFR-PHASE2.md 9](HFR-PHASE2.md#9-environment-variables); phase 3:
 | `MOJORECOMP_CUSTOM_SETTINGS=<path>` | beside `settings.toml` | Use this `custom-settings.toml`; startup fails if it is missing |
 | `MOJORECOMP_EDRAM_PAIR_BOUND=0` | on | Size EDRAM surfaces from the frame height only (the pre-fix behaviour of [6.1](#61-blocky-strip-at-the-top-of-the-frame-found-in-play-testing)) |
 | `MOJORECOMP_EDRAM_ALIAS_REDIRECT=0` | on | Move whole surfaces to MSAA views for their clears again instead of drawing into the owner ([6.4](#64-msaa-alias-redirect)) |
+| `MOJORECOMP_EDRAM_DEPTH_AS_COLOR=0` | on | Move color to the depth view for depth-only clears over it again ([6.5](#65-depth-clears-over-a-color-surface-drawn-as-color)) |
 | `MOJORECOMP_EDRAM_STENCIL_COPY=0` | on | Use the eight stencil bit-plane draws instead of the compute stencil copy ([6.2](#62-cheaper-stencil-for-edram-depth-transfers)) |
 
 ## 11. Files

@@ -1587,6 +1587,9 @@ struct ShaderModuleRec
     // The guest shader exports depth itself (not only the host's optional
     // float24 conversion of the rasterized depth, which also sets writesDepth).
     bool exportsDepth = false;
+    // A host-built pixel shader (not translated guest code): kept out of the
+    // pipeline manifest, which the next start prewarms from the shader cache.
+    bool hostShader = false;
     // AttributeLayoutHash(*this), fixed once the metadata is populated.
     uint64_t attributeLayoutHash = 0;
 };
@@ -11580,7 +11583,8 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
         }
         remember();
     }
-    RecordPipelineManifest(requested);
+    if (!ps.hostShader)
+        RecordPipelineManifest(requested);
     KLOG_DIAG("Vulkan pipeline created VS=%016llX PS=%016llX prim=%u attrs=%zu mask=%X "
          "blend0=%08X blend1=%08X depth=%08X raster=%03X alphaTest=%u mode=%u restart=%u samples=%u depthFmt=%u\n",
          static_cast<unsigned long long>(vs.hash), static_cast<unsigned long long>(ps.hash),
@@ -14273,6 +14277,209 @@ EdramAliasRefusal FindEdramAliasRedirect(const uint32_t* regs, const Pm4Draw& dr
     return EdramAliasRefusal::None;
 }
 
+// A depth-only rectangle (mode 5) whose depth tiles currently hold a color
+// surface: COT clears RT1 through a 4x view's depth this way. It writes one
+// 32-bit depth/stencil word per sample, so it is drawn into the color owner
+// as the color bytes the transfer shaders would unpack from that word
+// (stencil in R, the 24-bit depth in G, B and A), instead of moving the
+// color to the depth view and back. Only when the written word is the same
+// for every sample: depth test off or ALWAYS, stencil written only by
+// REPLACE/ZERO under ALWAYS with a full write mask. Color and depth views of
+// a tile swap their two 40-sample halves, so each half is drawn in its own
+// pass, shifted by half a tile. MOJORECOMP_EDRAM_DEPTH_AS_COLOR=0 turns it off.
+struct EdramDepthAsColorClear
+{
+    uint32_t surfaceInfo = 0;  // the color owner
+    uint32_t colorInfo = 0;
+    uint32_t scaleX = 1;
+    uint32_t scaleY = 1;
+    uint32_t colorMask = 0;    // target 0: R = stencil, GBA = depth
+    uint32_t stencil = 0;      // the stencil value written
+    bool float24 = false;
+    uint32_t tileWidthPixels = 0;  // the owner's tile width in its pixels
+};
+
+bool EdramDepthAsColorEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_EDRAM_DEPTH_AS_COLOR");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+bool FindEdramDepthAsColorClear(const uint32_t* regs, const Pm4Draw& draw, uint32_t mode,
+                                uint32_t depthControl, EdramDepthAsColorClear& out)
+{
+    if (!EdramAliasRedirectEnabled() || !EdramDepthAsColorEnabled() || mode != 5 ||
+        draw.primType != xenos::kRectangleList)
+        return false;
+    constexpr uint32_t kAlways = 7u;
+    const bool depthTest = ((depthControl >> 1) & 1u) != 0;
+    if (depthTest && ((depthControl >> 4) & 7u) != kAlways)
+        return false;
+    const bool writesDepth = depthTest && ((depthControl >> 2) & 1u) != 0;
+    bool writesStencil = false;
+    uint32_t stencil = 0;
+    if (depthControl & 1u)
+    {
+        // Rectangles are not polygons, so the front-face stencil state applies.
+        const uint32_t func = (depthControl >> 8) & 7u;
+        const uint32_t failOp = (depthControl >> 11) & 7u;
+        const uint32_t passOp = (depthControl >> 14) & 7u;
+        const uint32_t refMask = regs[xenos::kRbStencilRefMask];
+        if (func != kAlways)
+        {
+            if (failOp || passOp)
+                return false;
+        }
+        else if (passOp)
+        {
+            // KEEP 0, ZERO 1, REPLACE 2; the others depend on the old value.
+            if (passOp > 2u || ((refMask >> 16) & 0xFFu) != 0xFFu)
+                return false;
+            writesStencil = true;
+            stencil = passOp == 2u ? (refMask & 0xFFu) : 0u;
+        }
+    }
+    if (!writesDepth && !writesStencil)
+        return false;
+
+    const uint32_t depthInfo = regs[xenos::kRbDepthInfo];
+    const uint32_t baseTiles = xenos::DepthBaseTiles(depthInfo);
+    const EdramOwner& owner = g_edramOwners[baseTiles];
+    if (owner.kind != EdramOwnerKind::Color)
+        return false;
+    const uint32_t ownerSurface = uint32_t(owner.key >> 32);
+    const uint32_t ownerColorInfo = uint32_t(owner.key);
+    // A 32bpp 8_8_8_8 owner starting at the depth's base tile.
+    if (xenos::ColorBaseTiles(ownerColorInfo) != baseTiles ||
+        xenos::ColorFormat(ownerColorInfo) > 1u)
+        return false;
+    const uint32_t surface = regs[xenos::kRbSurfaceInfo];
+    const uint32_t samples = 1u << uint32_t(xenos::SurfaceMsaaSamples(surface));
+    const uint32_t ownerSamples = 1u << uint32_t(xenos::SurfaceMsaaSamples(ownerSurface));
+    const uint32_t pitchTiles = xenos::SurfacePitchTiles(surface, false);
+    const uint32_t ownerPitchTiles = xenos::SurfacePitchTiles(ownerSurface, false);
+    mojorecomp::gpu::EdramAliasScale scale{};
+    if (samples == ownerSamples && pitchTiles == ownerPitchTiles && pitchTiles)
+        scale = {1, 1};
+    else
+        scale = mojorecomp::gpu::EdramAliasPixelScale(samples, pitchTiles, ownerSamples,
+                                                      ownerPitchTiles);
+    if (!scale.x)
+        return false;
+
+    out.surfaceInfo = ownerSurface;
+    out.colorInfo = ownerColorInfo;
+    out.scaleX = scale.x;
+    out.scaleY = scale.y;
+    out.colorMask = (writesStencil ? 0x1u : 0u) | (writesDepth ? 0xEu : 0u);
+    out.stencil = stencil;
+    out.float24 = ((depthInfo >> 16) & 1u) != 0;
+    out.tileWidthPixels = xenos::EdramTileWidthPixels(ownerSurface, false);
+    return true;
+}
+
+// The pixel shader of one half of a depth-as-color clear: keeps the first or
+// second half of every owner tile and writes the clear's word as color.
+std::deque<ShaderModuleRec> g_edramDepthAsColorShaders;
+
+ShaderModuleRec* GetEdramDepthAsColorShader(const EdramDepthAsColorClear& clear, bool secondHalf)
+{
+    const uint32_t tileHostWidth = clear.tileWidthPixels * g_resolutionScale;
+    const uint64_t hash = 0xDAC0000000000000ull | (uint64_t(clear.stencil & 0xFFu) << 24) |
+                          (uint64_t(clear.float24) << 23) | (uint64_t(secondHalf) << 22) |
+                          (tileHostWidth & 0x3FFFFFu);
+    for (ShaderModuleRec& rec : g_edramDepthAsColorShaders)
+        if (rec.hash == hash)
+            return rec.module ? &rec : nullptr;
+
+    std::ostringstream h;
+    h << "#define STENCIL_VALUE " << (clear.stencil & 0xFFu) << "u\n"
+      << "#define DEPTH_FLOAT24 " << (clear.float24 ? 1 : 0) << "\n"
+      << "#define SECOND_HALF " << (secondHalf ? 1 : 0) << "\n"
+      << "#define TILE_HOST_WIDTH " << tileHostWidth << "u\n";
+    // Float32To20e4 and UnpackColor are the transfer shaders' (same code).
+    h << R"(
+uint Float32To20e4(float value)
+{
+    if (!(value > 0.0f))
+        return 0u;
+    uint bits = asuint(value);
+    if (bits >= 0x3FFFFFF8u)
+        return 0xFFFFFFu;
+    if (bits < 0x38800000u)
+    {
+        uint shift = min(113u - (bits >> 23), 24u);
+        bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+    }
+    else
+    {
+        bits += 0xC8000000u;
+    }
+    bits += 3u + ((bits >> 3) & 1u);
+    return (bits >> 3) & 0xFFFFFFu;
+}
+
+float4 UnpackColor(uint p)
+{
+    return float4(float(p & 255u), float((p >> 8) & 255u),
+                  float((p >> 16) & 255u), float((p >> 24) & 255u)) / 255.0f;
+}
+
+float4 main(float4 position : SV_Position) : SV_Target0
+{
+    uint local = uint(position.x) % TILE_HOST_WIDTH;
+    if ((local >= TILE_HOST_WIDTH / 2u) != (SECOND_HALF != 0))
+        discard;
+#if DEPTH_FLOAT24
+    uint d24 = Float32To20e4(position.z * 2.0f);
+#else
+    uint d24 = (uint)round(saturate(position.z) * 16777215.0f);
+#endif
+    return UnpackColor(STENCIL_VALUE | ((d24 & 0xFFFFFFu) << 8));
+}
+)";
+    ShaderModuleRec rec{};
+    rec.type = 1;
+    rec.hash = hash;
+    rec.usesAlu = false;
+    rec.colorOutputMask = 1;
+    rec.hostShader = true;
+    std::vector<uint8_t> spirv;
+    std::string err;
+    if (ShaderTranslator::CompileHostHlsl(h.str(), false, spirv, err))
+    {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = spirv.size();
+        ci.pCode = reinterpret_cast<const uint32_t*>(spirv.data());
+        if (p_vkCreateShaderModule(g_device, &ci, nullptr, &rec.module) != VK_SUCCESS)
+            rec.module = VK_NULL_HANDLE;
+    }
+    else
+    {
+        KLOG("Vulkan EDRAM depth-as-color shader compile failed: %s\n", err.c_str());
+    }
+    g_edramDepthAsColorShaders.push_back(rec);
+    return rec.module ? &g_edramDepthAsColorShaders.back() : nullptr;
+}
+
+// The rectangle shift (owner pixels) and kept tile half of each pass of a
+// depth-as-color clear: a word the depth view writes at tile column c lands
+// in the color view at column (c + half) mod tile width.
+struct EdramDepthAsColorPass
+{
+    int32_t shiftPixels;
+    bool secondHalf;
+};
+
+std::array<EdramDepthAsColorPass, 2> EdramDepthAsColorPasses(const EdramDepthAsColorClear& clear)
+{
+    const int32_t half = int32_t(clear.tileWidthPixels / 2u);
+    return {{{half, true}, {-half, false}}};
+}
+
 bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                        const uint32_t* regs, uint64_t vsHash, uint64_t psHash)
 {
@@ -14982,8 +15189,46 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                  regs[xenos::kRbSurfaceInfo], static_cast<unsigned long long>(psHash));
         reported[size_t(aliasRefusal)] = true;
     }
-    const uint32_t surfaceInfo =
-        aliasRedirected ? aliasRedirect.surfaceInfo : regs[xenos::kRbSurfaceInfo];
+    EdramDepthAsColorClear depthAsColor{};
+    std::array<VkPipeline, 2> depthAsColorPipelines{};
+    bool depthAsColorClear = aliasRefusal == EdramAliasRefusal::NoAliasOwner &&
+        FindEdramDepthAsColorClear(regs, draw, mode, depthControl, depthAsColor);
+    if (depthAsColorClear)
+    {
+        const auto passes = EdramDepthAsColorPasses(depthAsColor);
+        for (size_t i = 0; i < passes.size() && depthAsColorClear; ++i)
+        {
+            ShaderModuleRec* shader = GetEdramDepthAsColorShader(depthAsColor,
+                                                                 passes[i].secondHalf);
+            depthAsColorPipelines[i] = shader
+                ? GetPipeline(*vs, *shader, draw.primType, depthAsColor.colorMask,
+                              0x00010001u, 0x00010001u, 0u, regs[xenos::kPaSuScModeCntl] & 7u,
+                              0u, 4u, PrimitiveRestartEnabled(draw, regs),
+                              VK_SAMPLE_COUNT_1_BIT, kDepthUnormFormat)
+                : VK_NULL_HANDLE;
+            depthAsColorClear = depthAsColorPipelines[i] != VK_NULL_HANDLE;
+        }
+    }
+    const uint32_t surfaceInfo = aliasRedirected ? aliasRedirect.surfaceInfo
+                                 : depthAsColorClear ? depthAsColor.surfaceInfo
+                                                     : regs[xenos::kRbSurfaceInfo];
+    const uint32_t color0Info =
+        depthAsColorClear ? depthAsColor.colorInfo : regs[xenos::kRbColorInfo];
+    const bool bindDepth = usesDepth && !depthAsColorClear;
+    if (depthAsColorClear)
+    {
+        aliasRedirect.scaleX = depthAsColor.scaleX;
+        aliasRedirect.scaleY = depthAsColor.scaleY;
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::aliasRedirects);
+        static bool reported = false;
+        if (!reported || traceDrawFrame)
+            KLOG("Vulkan EDRAM depth clear drawn as color: frame=%llu surface=%08X -> %08X "
+                 "color=%08X scale=%ux%u mask=%X stencil=%u float24=%u\n",
+                 static_cast<unsigned long long>(diagnosticFrame), regs[xenos::kRbSurfaceInfo],
+                 surfaceInfo, color0Info, depthAsColor.scaleX, depthAsColor.scaleY,
+                 depthAsColor.colorMask, depthAsColor.stencil, depthAsColor.float24 ? 1u : 0u);
+        reported = true;
+    }
     if (aliasRedirected)
     {
         GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::aliasRedirects);
@@ -15000,12 +15245,12 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                  static_cast<unsigned long long>(diagnosticFrame), regs[xenos::kRbSurfaceInfo],
                  surfaceInfo, aliasRedirect.scaleX, aliasRedirect.scaleY);
     }
-    if (!SwitchActiveColorSurfaces(surfaceInfo, regs[xenos::kRbColorInfo],
+    if (!SwitchActiveColorSurfaces(surfaceInfo, color0Info,
                                    regs[xenos::kRbColor1Info], writesRt1, false))
         return false;
     if (!SwitchActiveDepthSurface(surfaceInfo,
                                   regs[xenos::kRbDepthInfo],
-                                  usesDepth, false))
+                                  bindDepth, false))
         return false;
     NoteActiveEdramSurfacePair();
 
@@ -15015,13 +15260,13 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     // first and color afterwards, matching the effective precedence used by
     // the host-render-target path when both are active. In DepthOnly mode the
     // color target remains bound but never takes ownership.
-    if (usesDepth && g_activeDepthEnabled &&
+    if (bindDepth && g_activeDepthEnabled &&
         g_activeDepthSurfaceKey != UINT64_MAX)
     {
         if (!ClaimEdramOwnership({EdramOwnerKind::Depth, g_activeDepthSurfaceKey}))
             return false;
     }
-    if (mode == 4 && (colorMask & 0xFu) != 0 &&
+    if ((depthAsColorClear || (mode == 4 && (colorMask & 0xFu) != 0)) &&
         g_activeColorSurfaceKey != UINT64_MAX)
     {
         if (!ClaimEdramOwnership({EdramOwnerKind::Color, g_activeColorSurfaceKey}))
@@ -15117,7 +15362,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     VkViewport logicalViewport =
         DecodeViewport(regs, logicalTileCoordinates, shaderWritesDepth, depthControl);
     VkViewport viewport = ScaleViewportToInternal(logicalViewport);
-    if (aliasRedirected)
+    if (aliasRedirected || depthAsColorClear)
     {
         // Alias pixels span scaleX x scaleY owner pixels (see FindEdramAliasRedirect).
         viewport.x *= float(aliasRedirect.scaleX);
@@ -15140,11 +15385,13 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         ++g_alphaTestDraws;
     const bool primitiveRestart = PrimitiveRestartEnabled(draw, regs);
     const auto pipelineStart = DetailedCpuTimerStart();
-    const VkPipeline pipeline = GetPipeline(*vs, *ps, draw.primType, colorMask,
-                                             blendControl0, blendControl1,
-                                             depthControl, rasterState, alphaTest, mode,
-                                             primitiveRestart, rasterSamples,
-                                             pipelineDepthFormat);
+    const VkPipeline pipeline = depthAsColorClear
+        ? depthAsColorPipelines[0]
+        : GetPipeline(*vs, *ps, draw.primType, colorMask,
+                      blendControl0, blendControl1,
+                      depthControl, rasterState, alphaTest, mode,
+                      primitiveRestart, rasterSamples,
+                      pipelineDepthFormat);
     DetailedCpuTimerAccumulate(pipelineStart, g_perfPipelineNs);
     if (!pipeline)
     {
@@ -15254,7 +15501,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     VkRect2D scissor = DecodeScissor(regs, false);
     if (!scissor.extent.width || !scissor.extent.height)
         return true;
-    if (aliasRedirected)
+    if (aliasRedirected || depthAsColorClear)
     {
         const uint32_t x0 = std::min(uint32_t(scissor.offset.x) * aliasRedirect.scaleX,
                                      g_extent.width);
@@ -15447,13 +15694,44 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     if (psRole == mojorecomp::gpu::PixelShaderRole::MotionBlur)
         GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::frontPassDraws);
     ++g_renderWriteGeneration;
-    if (prepared.indexed)
+    const auto issueDraw = [&]() {
+        if (prepared.indexed)
+        {
+            p_vkCmdDrawIndexed(g_commandBuffer, prepared.count, 1, 0, prepared.baseVertex, 0);
+            ++g_indexedDraws;
+        }
+        else
+            p_vkCmdDraw(g_commandBuffer, prepared.count, 1, 0, 0);
+    };
+    if (depthAsColorClear)
     {
-        p_vkCmdDrawIndexed(g_commandBuffer, prepared.count, 1, 0, prepared.baseVertex, 0);
-        ++g_indexedDraws;
+        // Each tile half in its own pass: the rectangle shifted by half a
+        // tile, viewport in host pixels and scissor in logical pixels.
+        const auto passes = EdramDepthAsColorPasses(depthAsColor);
+        for (size_t i = 0; i < passes.size(); ++i)
+        {
+            const int32_t shift = passes[i].shiftPixels;
+            const int64_t x0 = std::clamp<int64_t>(int64_t(scissor.offset.x) + shift, 0,
+                                                   g_extent.width);
+            const int64_t x1 = std::clamp<int64_t>(int64_t(scissor.offset.x) +
+                                                       scissor.extent.width + shift,
+                                                   0, g_extent.width);
+            if (x1 <= x0)
+                continue;
+            VkViewport shifted = viewport;
+            shifted.x += float(shift) * float(g_resolutionScale);
+            CmdSetViewportCached(g_commandBuffer, shifted);
+            CmdSetScissorCached(g_commandBuffer,
+                                ScaleRectToInternal({{int32_t(x0), scissor.offset.y},
+                                                     {uint32_t(x1 - x0), scissor.extent.height}}));
+            CmdBindGraphicsPipelineCached(g_commandBuffer, depthAsColorPipelines[i]);
+            issueDraw();
+        }
     }
     else
-        p_vkCmdDraw(g_commandBuffer, prepared.count, 1, 0, 0);
+    {
+        issueDraw();
+    }
     if (gpuTimingIndex != UINT32_MAX)
     {
         auto& frame = g_frameContexts[g_frameSlot];
@@ -15462,7 +15740,16 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                               frame.timestampPool, query);
     }
 
-    if (mode == 4 && colorMask != 0)
+    if (depthAsColorClear)
+    {
+        if (ColorBacking* backing = ActiveColorBacking())
+        {
+            backing->lastWriteFrame = g_frames.load(std::memory_order_relaxed) + 1;
+            backing->lastWriteDraw = g_draws + 1;
+            backing->lastWriteGeneration = g_renderWriteGeneration;
+        }
+    }
+    else if (mode == 4 && colorMask != 0)
     {
         auto recordWrite = [&](ColorBacking* backing, uint32_t targetMask)
         {
@@ -16058,6 +16345,10 @@ void VkPresenter_Shutdown()
     g_depthSnapshotPackPipelines.clear();
     if (g_edramTransferVs && p_vkDestroyShaderModule)
         p_vkDestroyShaderModule(g_device, g_edramTransferVs, nullptr);
+    for (ShaderModuleRec& rec : g_edramDepthAsColorShaders)
+        if (rec.module && p_vkDestroyShaderModule)
+            p_vkDestroyShaderModule(g_device, rec.module, nullptr);
+    g_edramDepthAsColorShaders.clear();
     if (g_edramTransferPipelineLayout && p_vkDestroyPipelineLayout)
         p_vkDestroyPipelineLayout(g_device, g_edramTransferPipelineLayout, nullptr);
     if (g_edramTransferPool && p_vkDestroyDescriptorPool)

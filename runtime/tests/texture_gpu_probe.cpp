@@ -806,6 +806,351 @@ static void CheckEdramAliasMapping(uint32_t scale)
     std::printf("PASS: MSAA alias pixels map to the scaled owner rectangle (scale %u)\n", scale);
 }
 
+// The transfer shaders' Float32To20e4, for the probe's expected values.
+static uint32_t Float32To20e4ForProbe(float value)
+{
+    if (!(value > 0.0f))
+        return 0u;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if (bits >= 0x3FFFFFF8u)
+        return 0xFFFFFFu;
+    if (bits < 0x38800000u)
+    {
+        const uint32_t shift = std::min(113u - (bits >> 23), 24u);
+        bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+    }
+    else
+    {
+        bits += 0xC8000000u;
+    }
+    bits += 3u + ((bits >> 3) & 1u);
+    return (bits >> 3) & 0xFFFFFFu;
+}
+
+// Which depth-only rectangles FindEdramDepthAsColorClear draws as color.
+static void CheckEdramDepthAsColorDecision()
+{
+    for (auto& owner : g_edramOwners)
+        owner = {};
+    g_edramOwners[0x438] = {EdramOwnerKind::Color, (uint64_t(0x078101E0u) << 32) | 0x438u};
+    std::vector<uint32_t> regs(0x5000);
+    regs[xenos::kRbSurfaceInfo] = 0x03C200F0u;
+    regs[xenos::kRbDepthInfo] = 0x00000438u;
+    regs[xenos::kRbStencilRefMask] = 0x00FF005Au;
+    Pm4Draw draw{};
+    draw.primType = xenos::kRectangleList;
+    EdramDepthAsColorClear clear{};
+    const auto decide = [&](uint32_t mode, uint32_t depthControl) {
+        clear = {};
+        return FindEdramDepthAsColorClear(regs.data(), draw, mode, depthControl, clear);
+    };
+    // COT's RT1 clear: depth and stencil REPLACE, both ALWAYS.
+    Require(decide(5, 0x8777u) && clear.surfaceInfo == 0x078101E0u && clear.colorInfo == 0x438u &&
+                clear.scaleX == 2 && clear.scaleY == 1 && clear.colorMask == 0xFu &&
+                clear.stencil == 0x5Au && !clear.float24 && clear.tileWidthPixels == 80,
+            "the RT1 depth clear through the 4x view must be drawn as color");
+    Require(decide(5, 0x0076u) && clear.colorMask == 0xEu, "a depth-only write keeps R");
+    Require(decide(5, 0x8701u) && clear.colorMask == 0x1u, "a stencil-only write keeps GBA");
+    Require(decide(5, 0x4701u) && clear.stencil == 0, "stencil ZERO writes 0");
+    Require(!decide(4, 0x8777u), "a draw that also writes color is not a depth clear");
+    Require(!decide(5, 0x8767u), "a depth test other than ALWAYS reads the old depth");
+    Require(!decide(5, 0xC777u), "stencil INCR depends on the old stencil");
+    Require(!decide(5, 0x8677u), "a stencil test other than ALWAYS reads the old stencil");
+    Require(!decide(5, 0x0002u), "a draw writing nothing is left alone");
+    regs[xenos::kRbStencilRefMask] = 0x000F005Au;
+    Require(!decide(5, 0x8701u), "a partial stencil write mask keeps old bits");
+    regs[xenos::kRbStencilRefMask] = 0x00FF005Au;
+    regs[xenos::kRbDepthInfo] = 0x00010438u;
+    Require(decide(5, 0x8777u) && clear.float24, "a float24 depth clear is flagged");
+    regs[xenos::kRbDepthInfo] = 0x00000438u;
+    draw.primType = xenos::kTriangleList;
+    Require(!decide(5, 0x8777u), "only rectangle lists are drawn as color");
+    draw.primType = xenos::kRectangleList;
+    g_edramOwners[0x438] = {EdramOwnerKind::Depth, (uint64_t(0x078101E0u) << 32) | 0x438u};
+    Require(!decide(5, 0x8777u), "a depth owner is the alias redirect's case");
+    for (auto& owner : g_edramOwners)
+        owner = {};
+    std::puts("PASS: depth-as-color clear decisions");
+}
+
+// A depth/stencil clear through the 4x view over a 2x color owner, the old
+// way (color -> depth view by transfer, clear the rectangle, transfer back)
+// and drawn as color in two passes, must leave identical color words.
+static void CheckEdramDepthAsColor(uint32_t scale)
+{
+    mojorecomp::config::RuntimeConfig config{};
+    config.resolutionScale = scale;
+    mojorecomp::config::Set(config);
+    Require(HostWindow_Init(1280, 720, true), "hidden depth-as-color window");
+    Require(VkPresenter_Init(HostWindow_NativeHandle(), 1280, 720), "depth-as-color presenter");
+    g_shaderStencilExport = false;
+    const uint32_t width = g_internalExtent.width;
+    const uint32_t height = g_internalExtent.height;
+    const VkDeviceSize pixels = VkDeviceSize(width) * height;
+    ProbeBuffer buffer = CreateProbeBuffer(12 * pixels);
+    auto* words = reinterpret_cast<uint32_t*>(buffer.mapped);
+    for (VkDeviceSize i = 0; i < pixels; ++i)
+        words[i] = ((uint32_t(i) * 0x9E3779B1u) & 0x3F3F3F3Fu) | 0x40404040u;
+    const VkDeviceSize oldWay = 4 * pixels, asColor = 8 * pixels;
+
+    constexpr uint32_t ownerSurface = 0x078101E0u, aliasSurface = 0x03C200F0u;
+    ColorBacking* colorBacking = nullptr;
+    Require(CreateColorBacking(ownerSurface, 0x438u, colorBacking), "owner color");
+    const uint64_t ownerKey = ColorSurfaceKey(ownerSurface, 0x438u);
+    const auto copyOwner = [&](VkDeviceSize offset, bool toImage) {
+        ColorBacking* image = FindColorBacking(ownerKey);
+        TransitionColorBacking(*image, toImage ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                               : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        if (toImage)
+            p_vkCmdCopyBufferToImage(g_commandBuffer, buffer.buffer, image->image,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        else
+            p_vkCmdCopyImageToBuffer(g_commandBuffer, image->image,
+                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
+                                     &region);
+    };
+
+    // A full-screen triangle at a constant depth for the color passes.
+    static constexpr float kDepth = 0.625f;  // exact in float32 and unambiguous in D24
+    std::vector<uint8_t> vsSpv;
+    std::string err;
+    Require(ShaderTranslator::CompileHostHlsl(R"(
+float4 main(uint id : SV_VertexID) : SV_Position
+{
+    float2 p = id == 0 ? float2(-1.0, -1.0) : id == 1 ? float2(-1.0, 3.0) : float2(3.0, -1.0);
+    return float4(p, 0.625, 1.0);
+}
+)", true, vsSpv, err), "depth-as-color probe VS");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = vsSpv.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(vsSpv.data());
+    VkShaderModule vsModule = VK_NULL_HANDLE;
+    Require(p_vkCreateShaderModule(g_device, &moduleInfo, nullptr, &vsModule) == VK_SUCCESS,
+            "probe VS module");
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    Require(p_vkCreatePipelineLayout(g_device, &layoutInfo, nullptr, &layout) == VK_SUCCESS,
+            "probe layout");
+    std::vector<VkPipeline> pipelines;
+    const auto makePipeline = [&](VkShaderModule ps, uint32_t colorMask) {
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_VERTEX_BIT, vsModule, "main", nullptr};
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                     VK_SHADER_STAGE_FRAGMENT_BIT, ps, "main", nullptr};
+        VkPipelineVertexInputStateCreateInfo vertex{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{
+            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{
+            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState blend{};
+        blend.colorWriteMask = colorMask;
+        VkPipelineColorBlendStateCreateInfo blendState{
+            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blendState.attachmentCount = 1;
+        blendState.pAttachments = &blend;
+        const VkDynamicState dynamics[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = 2;
+        dynamic.pDynamicStates = dynamics;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachmentFormats = &g_swapFormat;
+        VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        ci.pNext = &rendering;
+        ci.stageCount = 2;
+        ci.pStages = stages;
+        ci.pVertexInputState = &vertex;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vp;
+        ci.pRasterizationState = &raster;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &blendState;
+        ci.pDynamicState = &dynamic;
+        ci.layout = layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        Require(p_vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                            &pipeline) == VK_SUCCESS,
+                "probe depth-as-color pipeline");
+        pipelines.push_back(pipeline);
+        return pipeline;
+    };
+
+    struct DepthAsColorCase
+    {
+        const char* name;
+        uint32_t depthInfo;
+        VkRect2D aliasRect;  // 4x view pixels
+        bool writesDepth;
+        bool writesStencil;
+        uint32_t stencil;
+    };
+    static constexpr DepthAsColorCase kCases[] = {
+        {"COT RT1 clear (tile-aligned, depth + stencil)", 0x00000438u, {{0, 0}, {200, 720}},
+         true, true, 0xA5u},
+        {"partial tiles, stencil only", 0x00000438u, {{10, 8}, {120, 64}}, false, true, 0xC3u},
+        {"partial tiles, float24 depth only", 0x00010438u, {{25, 16}, {70, 24}}, true, false, 0u},
+    };
+    for (const DepthAsColorCase& c : kCases)
+    {
+        DepthBacking* depthBacking = nullptr;
+        const uint64_t aliasKey = (uint64_t(aliasSurface) << 32) | c.depthInfo;
+        Require(CreateDepthBacking(aliasKey, depthBacking), c.name);
+
+        Require(BeginFrame(), c.name);
+        // The old way.
+        copyOwner(0, true);
+        Require(TransferEdramOwnershipSpan({EdramOwnerKind::Color, ownerKey},
+                                           {EdramOwnerKind::Depth, aliasKey}, 0, 540),
+                c.name);
+        DepthBacking* depth = FindDepthBacking(aliasKey);
+        TransitionDepthBacking(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depthAttachment.imageView = depth->view;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, g_internalExtent};
+        rendering.layerCount = 1;
+        rendering.pDepthAttachment = &depthAttachment;
+        rendering.pStencilAttachment = &depthAttachment;
+        p_vkCmdBeginRendering(g_commandBuffer, &rendering);
+        VkClearAttachment clearAttachment{};
+        clearAttachment.aspectMask = (c.writesDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) |
+                                     (c.writesStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        clearAttachment.clearValue.depthStencil = {kDepth, c.stencil};
+        const VkClearRect clearRect{ScaleRectToInternal(c.aliasRect), 0, 1};
+        p_vkCmdClearAttachments(g_commandBuffer, 1, &clearAttachment, 1, &clearRect);
+        p_vkCmdEndRendering(g_commandBuffer);
+        Require(TransferEdramOwnershipSpan({EdramOwnerKind::Depth, aliasKey},
+                                           {EdramOwnerKind::Color, ownerKey}, 0, 540),
+                c.name);
+        copyOwner(oldWay, false);
+
+        // Drawn as color: the passes the draw path uses.
+        copyOwner(0, true);
+        EdramDepthAsColorClear clear{};
+        clear.scaleX = 2;
+        clear.scaleY = 1;
+        clear.colorMask = (c.writesStencil ? 0x1u : 0u) | (c.writesDepth ? 0xEu : 0u);
+        clear.stencil = c.stencil;
+        clear.float24 = ((c.depthInfo >> 16) & 1u) != 0;
+        clear.tileWidthPixels = xenos::EdramTileWidthPixels(ownerSurface, false);
+        ColorBacking* owner = FindColorBacking(ownerKey);
+        TransitionColorBacking(*owner, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttachment.imageView = owner->view;
+        colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo colorRendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        colorRendering.renderArea = {{0, 0}, g_internalExtent};
+        colorRendering.layerCount = 1;
+        colorRendering.colorAttachmentCount = 1;
+        colorRendering.pColorAttachments = &colorAttachment;
+        p_vkCmdBeginRendering(g_commandBuffer, &colorRendering);
+        const VkRect2D ownerRect{{c.aliasRect.offset.x * 2, c.aliasRect.offset.y},
+                                 {c.aliasRect.extent.width * 2, c.aliasRect.extent.height}};
+        for (const EdramDepthAsColorPass& pass : EdramDepthAsColorPasses(clear))
+        {
+            ShaderModuleRec* shader = GetEdramDepthAsColorShader(clear, pass.secondHalf);
+            Require(shader != nullptr, "depth-as-color shader");
+            uint32_t writeMask = 0;
+            if (clear.colorMask & 1u) writeMask |= VK_COLOR_COMPONENT_R_BIT;
+            if (clear.colorMask & 2u) writeMask |= VK_COLOR_COMPONENT_G_BIT;
+            if (clear.colorMask & 4u) writeMask |= VK_COLOR_COMPONENT_B_BIT;
+            if (clear.colorMask & 8u) writeMask |= VK_COLOR_COMPONENT_A_BIT;
+            p_vkCmdBindPipeline(g_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                makePipeline(shader->module, writeMask));
+            VkViewport viewport{float(pass.shiftPixels) * float(scale), 0.0f, float(width),
+                                float(height), 0.0f, 1.0f};
+            p_vkCmdSetViewport(g_commandBuffer, 0, 1, &viewport);
+            const int32_t x0 = std::clamp(ownerRect.offset.x + pass.shiftPixels, 0, 1280);
+            const int32_t x1 = std::clamp(ownerRect.offset.x + int32_t(ownerRect.extent.width) +
+                                              pass.shiftPixels, 0, 1280);
+            if (x1 <= x0)
+                continue;
+            const VkRect2D scissor = ScaleRectToInternal(
+                {{x0, ownerRect.offset.y}, {uint32_t(x1 - x0), ownerRect.extent.height}});
+            p_vkCmdSetScissor(g_commandBuffer, 0, 1, &scissor);
+            p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
+        }
+        p_vkCmdEndRendering(g_commandBuffer);
+        copyOwner(asColor, false);
+        SubmitProbeFrame(c.name);
+
+        // The word the clear writes: stencil in byte 0, the 24-bit depth
+        // above it. Background bytes are 0x40..0x7F and no written byte is,
+        // so a pixel is inside the clear exactly when its written bytes match.
+        // Outside it the old way is not a reference: its round trip through
+        // the 4x view keeps one sample per 4x pixel.
+        const uint32_t d24 = clear.float24 ? Float32To20e4ForProbe(kDepth * 2.0f)
+                                           : uint32_t(std::lround(kDepth * 16777215.0));
+        // Channels R, G, B, A of the word; in memory BGRA images hold R in byte 2.
+        const uint32_t channels = c.stencil | (d24 << 8);
+        const bool bgra = g_swapFormat == VK_FORMAT_B8G8R8A8_UNORM;
+        uint32_t word = 0, byteMask = 0;
+        for (uint32_t channel = 0; channel < 4; ++channel)
+        {
+            const uint32_t byte = bgra && channel != 3 ? 2u - channel : channel;
+            const uint32_t value = (channels >> (channel * 8)) & 0xFFu;
+            word |= value << (byte * 8);
+            if (clear.colorMask & (1u << channel))
+            {
+                byteMask |= 0xFFu << (byte * 8);
+                Require(value < 0x40u || value > 0x7Fu, "probe clear bytes must differ from the background");
+            }
+        }
+        uint64_t inside = 0;
+        for (VkDeviceSize i = 0; i < pixels; ++i)
+        {
+            const uint32_t expected = words[oldWay / 4 + i];
+            const uint32_t actual = words[asColor / 4 + i];
+            const bool clearedOldWay = (expected & byteMask) == (word & byteMask);
+            const bool clearedAsColor = (actual & byteMask) == (word & byteMask);
+            const bool untouched = actual == words[i];
+            if (clearedOldWay != clearedAsColor ||
+                (clearedAsColor && (actual & ~byteMask) != (words[i] & ~byteMask)) ||
+                (!clearedAsColor && !untouched))
+            {
+                std::fprintf(stderr, "%s: pixel %llu,%llu old way %08X, as color %08X, before %08X\n",
+                             c.name, static_cast<unsigned long long>(i % width),
+                             static_cast<unsigned long long>(i / width), expected, actual,
+                             words[i]);
+                Require(false, "the color passes must write what the depth clear writes");
+            }
+            inside += clearedAsColor;
+        }
+        Require(inside == VkDeviceSize(c.aliasRect.extent.width) * 2u * c.aliasRect.extent.height *
+                              scale * scale,
+                "the clear must cover the scaled rectangle's area");
+        const uint64_t changed = inside;
+        std::printf("  ok: %s (scale %u, %llu pixels changed)\n", c.name, scale,
+                    static_cast<unsigned long long>(changed));
+    }
+    for (VkPipeline pipeline : pipelines)
+        p_vkDestroyPipeline(g_device, pipeline, nullptr);
+    p_vkDestroyPipelineLayout(g_device, layout, nullptr);
+    p_vkDestroyShaderModule(g_device, vsModule, nullptr);
+    DestroyProbeBuffer(buffer);
+    VkPresenter_Shutdown();
+    std::printf("PASS: depth clears drawn as color match the transfer path (scale %u)\n", scale);
+}
+
 // Informational (not a CTest): GPU time of a 540-tile depth transfer at scale 2,
 // with the stencil bit planes and with the compute stencil copy.
 static void BenchEdramStencilCopy()
@@ -1266,6 +1611,12 @@ int main(int argc, char** argv)
         {
             CheckEdramAliasRedirectDecision();
             CheckEdramAliasMapping(argc == 3 ? uint32_t(std::stoul(argv[2])) : 1u);
+            return 0;
+        }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--edram-depth-as-color")
+        {
+            CheckEdramDepthAsColorDecision();
+            CheckEdramDepthAsColor(argc == 3 ? uint32_t(std::stoul(argv[2])) : 1u);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--edram-stencil-copy-bench")
