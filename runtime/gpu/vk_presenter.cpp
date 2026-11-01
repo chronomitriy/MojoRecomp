@@ -1406,6 +1406,9 @@ enum class EdramTransferPass : uint8_t
     DepthStencilExport,
     DepthOnly,
     StencilBitPlanes,
+    // Compute shader: the destination's remapped stencil bytes, packed for a
+    // buffer-to-image copy (see RecordEdramStencilCopy).
+    StencilCopyCompute,
 };
 struct EdramTransferPipeline
 {
@@ -1423,6 +1426,21 @@ struct EdramTransferPipeline
     VkShaderModule ps = VK_NULL_HANDLE;
 };
 std::vector<EdramTransferPipeline> g_edramTransferPipelines;
+// Stencil part of an EDRAM transfer into a depth target on a device without
+// VK_EXT_shader_stencil_export. A compute pass writes the destination's
+// remapped stencil bytes to this scratch buffer and one buffer-to-image copy
+// stores them in its stencil aspect, instead of a stencil clear and eight
+// full-screen bit-plane draws. MOJORECOMP_EDRAM_STENCIL_COPY=0 keeps the bit
+// planes.
+VkDescriptorSetLayout g_edramStencilCopySetLayout = VK_NULL_HANDLE;
+VkDescriptorPool g_edramStencilCopyPool = VK_NULL_HANDLE;
+VkDescriptorSet g_edramStencilCopySet = VK_NULL_HANDLE;
+VkPipelineLayout g_edramStencilCopyPipelineLayout = VK_NULL_HANDLE;
+VkBuffer g_edramStencilCopyBuffer = VK_NULL_HANDLE;
+VkDeviceMemory g_edramStencilCopyMemory = VK_NULL_HANDLE;
+VkDeviceSize g_edramStencilCopyBytes = 0;
+// 0 = not set up yet, 1 = ready, -1 = unavailable (bit planes are used).
+int g_edramStencilCopyState = 0;
 std::thread g_edramShaderPrewarmThread;
 std::atomic<bool> g_edramShaderPrewarmStop{false};
 std::atomic<uint64_t> g_edramShaderPrewarmPrepared{0};
@@ -1695,8 +1713,10 @@ PFN_vkDestroyPipelineCache p_vkDestroyPipelineCache = nullptr;
 PFN_vkGetPipelineCacheData p_vkGetPipelineCacheData = nullptr;
 PFN_vkMergePipelineCaches p_vkMergePipelineCaches = nullptr;
 PFN_vkCreateGraphicsPipelines p_vkCreateGraphicsPipelines = nullptr;
+PFN_vkCreateComputePipelines p_vkCreateComputePipelines = nullptr;
 PFN_vkDestroyPipeline p_vkDestroyPipeline = nullptr;
 PFN_vkCmdBindPipeline p_vkCmdBindPipeline = nullptr;
+PFN_vkCmdDispatch p_vkCmdDispatch = nullptr;
 PFN_vkCmdSetViewport p_vkCmdSetViewport = nullptr;
 PFN_vkCmdSetScissor p_vkCmdSetScissor = nullptr;
 PFN_vkCmdSetBlendConstants p_vkCmdSetBlendConstants = nullptr;
@@ -3365,7 +3385,8 @@ void TransitionDepthBacking(DepthBacking& backing, VkImageLayout next)
     }
     else if (backing.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
     {
-        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        // Sampled by transfer pixel shaders and the stencil copy compute pass.
+        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         srcAccess = VK_ACCESS_SHADER_READ_BIT;
     }
 
@@ -3384,7 +3405,7 @@ void TransitionDepthBacking(DepthBacking& backing, VkImageLayout next)
     }
     else if (next == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
     {
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         dstAccess = VK_ACCESS_SHADER_READ_BIT;
     }
 
@@ -3425,7 +3446,8 @@ void TransitionColorBacking(ColorBacking& backing, VkImageLayout next)
     }
     else if (backing.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
     {
-        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        // Sampled by transfer pixel shaders and the stencil copy compute pass.
+        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         srcAccess = VK_ACCESS_SHADER_READ_BIT;
     }
 
@@ -3442,7 +3464,7 @@ void TransitionColorBacking(ColorBacking& backing, VkImageLayout next)
     }
     else if (next == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
     {
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         dstAccess = VK_ACCESS_SHADER_READ_BIT;
     }
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -3707,7 +3729,8 @@ VSOut main(uint id : SV_VertexID)
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // The stencil copy compute pass reads the same source descriptors.
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     setInfo.bindingCount = 2;
@@ -3741,6 +3764,159 @@ VSOut main(uint id : SV_VertexID)
     return true;
 }
 
+// Push constants of the stencil copy compute pass: the pixel shaders' five,
+// then the host rectangle it fills and where its rows start in the scratch
+// buffer.
+struct EdramStencilCopyPush
+{
+    uint32_t sourceBaseTiles;
+    uint32_t sourcePitchTiles;
+    uint32_t destBaseTiles;
+    uint32_t destPitchTiles;
+    uint32_t stencilBit;
+    uint32_t copyX;
+    uint32_t copyY;
+    uint32_t copyWidth;
+    uint32_t copyHeight;
+    uint32_t copyOffset;
+};
+
+bool EdramStencilCopyRequested()
+{
+    static const bool requested = [] {
+        const char* value = std::getenv("MOJORECOMP_EDRAM_STENCIL_COPY");
+        return !(value && value[0] == '0');
+    }();
+    return requested;
+}
+
+// Bytes one rectangle takes in the scratch buffer: tightly packed S8 rows,
+// each rounded up to whole 32-bit words because the compute pass writes words
+// (and depth/stencil buffer copies need 4-byte aligned offsets).
+VkDeviceSize EdramStencilCopyRectBytes(const VkRect2D& hostRect)
+{
+    return VkDeviceSize((hostRect.extent.width + 3u) & ~3u) * hostRect.extent.height;
+}
+
+// A guest transfer rectangle in host pixels, clipped to the backing images
+// (a buffer-to-image copy must stay inside them; the bit-plane draws are
+// clipped by the render area instead).
+VkRect2D EdramStencilCopyHostRect(const VkRect2D& logical)
+{
+    const VkRect2D scaled = ScaleRectToInternal(logical);
+    const int64_t x0 = std::clamp<int64_t>(scaled.offset.x, 0, g_internalExtent.width);
+    const int64_t y0 = std::clamp<int64_t>(scaled.offset.y, 0, g_internalExtent.height);
+    const int64_t x1 = std::clamp<int64_t>(int64_t(scaled.offset.x) + scaled.extent.width,
+                                           x0, g_internalExtent.width);
+    const int64_t y1 = std::clamp<int64_t>(int64_t(scaled.offset.y) + scaled.extent.height,
+                                           y0, g_internalExtent.height);
+    return {{int32_t(x0), int32_t(y0)}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+}
+
+bool EnsureEdramStencilCopyInfrastructure()
+{
+    if (g_edramStencilCopyState != 0)
+        return g_edramStencilCopyState > 0;
+    g_edramStencilCopyState = -1;
+    if (!EdramStencilCopyRequested())
+    {
+        KLOG("Vulkan EDRAM depth transfer stencil: bit planes "
+             "(MOJORECOMP_EDRAM_STENCIL_COPY=0)\n");
+        return false;
+    }
+    if (!EnsureEdramTransferInfrastructure() || !p_vkCreateComputePipelines || !p_vkCmdDispatch)
+        return false;
+    // The compute pass is recorded on the presenter's graphics queue.
+    uint32_t queueCount = 0;
+    p_vkGetPhysicalDeviceQueueFamilyProperties(g_physicalDevice, &queueCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queues(queueCount);
+    p_vkGetPhysicalDeviceQueueFamilyProperties(g_physicalDevice, &queueCount, queues.data());
+    if (g_queueFamily >= queueCount ||
+        !(queues[g_queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT))
+    {
+        KLOG("Vulkan EDRAM depth transfer stencil: bit planes (the queue has no compute)\n");
+        return false;
+    }
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setInfo.bindingCount = 1;
+    setInfo.pBindings = &binding;
+    if (p_vkCreateDescriptorSetLayout(g_device, &setInfo, nullptr,
+                                      &g_edramStencilCopySetLayout) != VK_SUCCESS)
+        return false;
+
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    if (p_vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
+                                 &g_edramStencilCopyPool) != VK_SUCCESS)
+        return false;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = g_edramStencilCopyPool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &g_edramStencilCopySetLayout;
+    if (p_vkAllocateDescriptorSets(g_device, &ai, &g_edramStencilCopySet) != VK_SUCCESS)
+        return false;
+
+    const VkDescriptorSetLayout setLayouts[2] = {g_edramTransferSetLayout,
+                                                 g_edramStencilCopySetLayout};
+    VkPushConstantRange range{};
+    range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    range.size = sizeof(EdramStencilCopyPush);
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 2;
+    layoutInfo.pSetLayouts = setLayouts;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &range;
+    if (p_vkCreatePipelineLayout(g_device, &layoutInfo, nullptr,
+                                 &g_edramStencilCopyPipelineLayout) != VK_SUCCESS)
+        return false;
+
+    // The rectangles of one transfer are disjoint and inside the internal
+    // extent; each rounds its rows up by at most 3 bytes.
+    const VkDeviceSize rowBytes = (VkDeviceSize(g_internalExtent.width) + 3u) & ~VkDeviceSize(3u);
+    g_edramStencilCopyBytes = (rowBytes + 16u) * g_internalExtent.height;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = g_edramStencilCopyBytes;
+    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (p_vkCreateBuffer(g_device, &bi, nullptr, &g_edramStencilCopyBuffer) != VK_SUCCESS)
+        return false;
+    VkMemoryRequirements req{};
+    p_vkGetBufferMemoryRequirements(g_device, g_edramStencilCopyBuffer, &req);
+    const uint32_t type = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type == UINT32_MAX)
+        return false;
+    VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mi.allocationSize = req.size;
+    mi.memoryTypeIndex = type;
+    if (p_vkAllocateMemory(g_device, &mi, nullptr, &g_edramStencilCopyMemory) != VK_SUCCESS ||
+        p_vkBindBufferMemory(g_device, g_edramStencilCopyBuffer, g_edramStencilCopyMemory, 0) !=
+            VK_SUCCESS)
+        return false;
+
+    VkDescriptorBufferInfo bufferInfo{g_edramStencilCopyBuffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = g_edramStencilCopySet;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufferInfo;
+    p_vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+
+    g_edramStencilCopyState = 1;
+    KLOG("Vulkan EDRAM depth transfer stencil: compute copy, %llu KiB scratch buffer\n",
+         static_cast<unsigned long long>(g_edramStencilCopyBytes / 1024u));
+    return true;
+}
+
 std::string BuildEdramTransferPixelShader(EdramOwnerKind sourceKind,
                                           EdramOwnerKind destKind,
                                           VkSampleCountFlagBits sourceSamples,
@@ -3763,6 +3939,8 @@ std::string BuildEdramTransferPixelShader(EdramOwnerKind sourceKind,
     h << "#define SRC_DEPTH_FLOAT24 " << (sourceDepthFloat24 ? 1 : 0) << "\n";
     h << "#define DST_DEPTH_FLOAT24 " << (destDepthFloat24 ? 1 : 0) << "\n";
     h << "#define HOST_SCALE " << g_resolutionScale << "u\n";
+    h << "#define STENCIL_COPY_CS "
+      << (pass == EdramTransferPass::StencilCopyCompute ? 1 : 0) << "\n";
     h << R"(
 struct TransferPush {
     uint sourceBaseTiles;
@@ -3770,6 +3948,13 @@ struct TransferPush {
     uint destBaseTiles;
     uint destPitchTiles;
     uint stencilBit;
+#if STENCIL_COPY_CS
+    uint copyX;
+    uint copyY;
+    uint copyWidth;
+    uint copyHeight;
+    uint copyOffset;
+#endif
 };
 [[vk::push_constant]] ConstantBuffer<TransferPush> g_Push;
 
@@ -3965,7 +4150,50 @@ uint LoadPhysical(float4 position, uint destSample)
 }
 )";
 
-    if (pass == EdramTransferPass::StencilBitPlanes)
+    if (pass == EdramTransferPass::StencilCopyCompute)
+    {
+        // The same stencil value the bit-plane passes build one bit at a time
+        // (LoadPhysical(...) & 255), for host 1x destinations. Each thread
+        // packs four horizontally adjacent pixels into one little-endian word
+        // of the S8 rows that vkCmdCopyBufferToImage reads.
+        h << R"(
+RWByteAddressBuffer g_StencilBytes : register(u0, space1);
+
+uint StencilAt(uint2 hostPixel)
+{
+    float4 position = float4(float2(hostPixel) + 0.5f, 0.0f, 1.0f);
+#if SRC_DEPTH
+    uint2 srcPixel;
+    uint srcSample;
+    MapPhysical(position, 0u, srcPixel, srcSample);
+  #if SRC_MSAA == 1
+    return g_SourceStencil.Load(int3(int2(srcPixel), 0)) & 255u;
+  #else
+    return g_SourceStencil.Load(int2(srcPixel), srcSample) & 255u;
+  #endif
+#else
+    return LoadPhysical(position, 0u) & 255u;
+#endif
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    uint rowWords = (g_Push.copyWidth + 3u) >> 2;
+    if (id.x >= rowWords || id.y >= g_Push.copyHeight)
+        return;
+    uint word = 0u;
+    [unroll] for (uint i = 0u; i < 4u; ++i)
+    {
+        uint x = id.x * 4u + i;
+        if (x < g_Push.copyWidth)
+            word |= StencilAt(uint2(g_Push.copyX + x, g_Push.copyY + id.y)) << (i * 8u);
+    }
+    g_StencilBytes.Store(g_Push.copyOffset + (id.y * rowWords + id.x) * 4u, word);
+}
+)";
+    }
+    else if (pass == EdramTransferPass::StencilBitPlanes)
     {
         h << "\nvoid main(float4 position : SV_Position";
         if (destSamples != VK_SAMPLE_COUNT_1_BIT)
@@ -4091,9 +4319,11 @@ void StartEdramShaderPrewarmWorker()
                     sourceDepthFloat24, destDepthFloat24, pass);
                 std::vector<uint8_t> spirv;
                 std::string err;
-                const bool ok = ShaderTranslator::CompileHostHlsl(
-                    hlsl, false, spirv, err,
-                    pass == EdramTransferPass::DepthStencilExport);
+                const bool ok = pass == EdramTransferPass::StencilCopyCompute
+                    ? ShaderTranslator::CompileHostComputeHlsl(hlsl, spirv, err)
+                    : ShaderTranslator::CompileHostHlsl(
+                          hlsl, false, spirv, err,
+                          pass == EdramTransferPass::DepthStencilExport);
                 if (ok)
                     g_edramShaderPrewarmPrepared.fetch_add(1, std::memory_order_relaxed);
                 else
@@ -4149,7 +4379,9 @@ void StartEdramShaderPrewarmWorker()
                                         compileVariant(sourceKind, destKind,
                                                        sourceGuest, destGuest,
                                                        sourceFloat != 0, destFloat != 0,
-                                                       EdramTransferPass::StencilBitPlanes);
+                                                       EdramStencilCopyRequested()
+                                                           ? EdramTransferPass::StencilCopyCompute
+                                                           : EdramTransferPass::StencilBitPlanes);
                                     }
                                 }
                             }
@@ -4212,9 +4444,14 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
                                                            destDepthFloat24, pass);
     std::vector<uint8_t> psSpv;
     std::string err;
-    if (!ShaderTranslator::CompileHostHlsl(hlsl, false, psSpv, err,
-                                           pass == EdramTransferPass::DepthStencilExport))
+    const bool compute = pass == EdramTransferPass::StencilCopyCompute;
+    if (!(compute ? ShaderTranslator::CompileHostComputeHlsl(hlsl, psSpv, err)
+                  : ShaderTranslator::CompileHostHlsl(
+                        hlsl, false, psSpv, err,
+                        pass == EdramTransferPass::DepthStencilExport)))
     {
+        if (compute)
+            g_edramStencilCopyState = -1;
         if (const char* dumpDir = std::getenv("MOJORECOMP_EDRAM_TRANSFER_SHADER_DUMP_DIR");
             dumpDir && *dumpDir)
         {
@@ -4255,6 +4492,31 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
     moduleInfo.pCode = reinterpret_cast<const uint32_t*>(psSpv.data());
     if (p_vkCreateShaderModule(g_device, &moduleInfo, nullptr, &rec.ps) != VK_SUCCESS)
         return nullptr;
+
+    if (compute)
+    {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = rec.ps;
+        ci.stage.pName = "main";
+        ci.layout = g_edramStencilCopyPipelineLayout;
+        const VkResult result = EnsureEdramStencilCopyInfrastructure()
+            ? p_vkCreateComputePipelines(g_device, g_pipelineCache, 1, &ci, nullptr,
+                                         &rec.pipeline)
+            : VK_ERROR_INITIALIZATION_FAILED;
+        if (result != VK_SUCCESS)
+        {
+            KLOG("Vulkan EDRAM stencil copy pipeline failed (%d) src=%u guest=%ux dst guest=%ux\n",
+                 result, uint32_t(sourceKind), uint32_t(sourceGuestSamples),
+                 uint32_t(destGuestSamples));
+            p_vkDestroyShaderModule(g_device, rec.ps, nullptr);
+            g_edramStencilCopyState = -1;
+            return nullptr;
+        }
+        g_edramTransferPipelines.push_back(rec);
+        return &g_edramTransferPipelines.back();
+    }
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -4783,6 +5045,79 @@ std::vector<VkRect2D> EdramTransferRects(uint32_t localStart, uint32_t count,
     return rects;
 }
 
+// Stencil of a transfer into a host 1x depth target without stencil export.
+// One dispatch per rectangle writes the remapped stencil bytes to the scratch
+// buffer, then one copy stores every rectangle in the destination's stencil
+// aspect; its depth (written by the transfer's depth pass) is untouched.
+// Leaves the destination in DEPTH_STENCIL_ATTACHMENT_OPTIMAL, like the
+// bit-plane path.
+void RecordEdramStencilCopy(DepthBacking& destBacking, VkPipeline pipeline,
+                            VkDescriptorSet sourceDescriptor,
+                            const EdramBackingMeta& source, const EdramBackingMeta& dest,
+                            const std::vector<VkRect2D>& rects)
+{
+    // The previous copy out of the scratch buffer (this command buffer or an
+    // earlier submission) must finish reading before it is overwritten.
+    VkBufferMemoryBarrier reuse{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    reuse.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    reuse.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    reuse.srcQueueFamilyIndex = reuse.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    reuse.buffer = g_edramStencilCopyBuffer;
+    reuse.size = VK_WHOLE_SIZE;
+    p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &reuse,
+                           0, nullptr);
+
+    p_vkCmdBindPipeline(g_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    const VkDescriptorSet sets[2] = {sourceDescriptor, g_edramStencilCopySet};
+    p_vkCmdBindDescriptorSets(g_commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              g_edramStencilCopyPipelineLayout, 0, 2, sets, 0, nullptr);
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(rects.size());
+    VkDeviceSize offset = 0;
+    for (const VkRect2D& rect : rects)
+    {
+        if (!rect.extent.width || !rect.extent.height)
+            continue;
+        const VkRect2D host = EdramStencilCopyHostRect(rect);
+        if (!host.extent.width || !host.extent.height)
+            continue;
+        const EdramStencilCopyPush push{source.baseTiles, source.pitchTiles,
+                                        dest.baseTiles, dest.pitchTiles, 0u,
+                                        uint32_t(host.offset.x), uint32_t(host.offset.y),
+                                        host.extent.width, host.extent.height,
+                                        uint32_t(offset)};
+        p_vkCmdPushConstants(g_commandBuffer, g_edramStencilCopyPipelineLayout,
+                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        const uint32_t rowWords = (host.extent.width + 3u) / 4u;
+        p_vkCmdDispatch(g_commandBuffer, (rowWords + 7u) / 8u, (host.extent.height + 7u) / 8u, 1);
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.bufferRowLength = rowWords * 4u;
+        region.bufferImageHeight = host.extent.height;
+        region.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+        region.imageOffset = {host.offset.x, host.offset.y, 0};
+        region.imageExtent = {host.extent.width, host.extent.height, 1};
+        regions.push_back(region);
+        offset += EdramStencilCopyRectBytes(host);
+    }
+    if (regions.empty())
+        return;
+
+    VkBufferMemoryBarrier written = reuse;
+    written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &written,
+                           0, nullptr);
+    TransitionDepthBacking(destBacking, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    p_vkCmdCopyBufferToImage(g_commandBuffer, g_edramStencilCopyBuffer, destBacking.image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             static_cast<uint32_t>(regions.size()), regions.data());
+    TransitionDepthBacking(destBacking, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
                                 const EdramOwner& destOwner,
                                 uint32_t destLocalStart, uint32_t tileCount)
@@ -4806,8 +5141,12 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         // contents even though the table says the destination owns the tiles.
         return false;
     }
-    GpuProfileScope gpuProfileScope(GpuPassCategory::Transfer);
+    GpuProfileScope gpuProfileScope(dest.kind == EdramOwnerKind::Depth
+                                        ? GpuPassCategory::TransferDepth
+                                        : GpuPassCategory::Transfer);
     GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::transfers);
+    if (dest.kind == EdramOwnerKind::Depth)
+        GpuProfileCount(&mojorecomp::gpu::GpuProfileCounts::depthTransfers);
 
     const bool sourceDepthFloat24 =
         source.kind == EdramOwnerKind::Depth && ((source.info >> 16) & 1u) != 0;
@@ -4828,29 +5167,52 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         dest.kind == EdramOwnerKind::Depth ? dest.format : VK_FORMAT_UNDEFINED,
         mainPass);
     const VkPipeline mainPipeline = pipeline ? pipeline->pipeline : VK_NULL_HANDLE;
-    EdramTransferPipeline* stencilPipeline = nullptr;
+    const uint32_t tileWidth = EdramTileWidthPixels(dest.guestSamples);
+    const uint32_t tileHeight = EdramTileHeightPixels(dest.guestSamples);
+    const auto rects = EdramTransferRects(destLocalStart, tileCount,
+                                          dest.pitchTiles, tileWidth, tileHeight);
+    // Without stencil export the stencil goes through the compute copy when
+    // it is available, else through eight bit-plane draws.
+    VkPipeline stencilCopyPipeline = VK_NULL_HANDLE;
+    VkPipeline stencilBitPlanePipeline = VK_NULL_HANDLE;
     if (dest.kind == EdramOwnerKind::Depth &&
         depthTransferMode == mojorecomp::gpu::EdramDepthTransferMode::FixedFunctionBitPlanes)
     {
-        static bool fallbackReported = false;
-        if (!fallbackReported)
+        VkDeviceSize copyBytes = 0;
+        for (const VkRect2D& rect : rects)
+            copyBytes += EdramStencilCopyRectBytes(EdramStencilCopyHostRect(rect));
+        if (dest.samples == VK_SAMPLE_COUNT_1_BIT && EnsureEdramStencilCopyInfrastructure() &&
+            copyBytes <= g_edramStencilCopyBytes)
         {
-            fallbackReported = true;
-            KLOG("Vulkan EDRAM depth transfer fallback active: fixed-function stencil bit planes\n");
+            if (EdramTransferPipeline* copy = GetEdramTransferPipeline(
+                    source.kind, dest.kind, source.samples, dest.samples,
+                    source.guestSamples, dest.guestSamples,
+                    source.pitchTiles, dest.pitchTiles,
+                    sourceDepthFloat24, destDepthFloat24, dest.format,
+                    EdramTransferPass::StencilCopyCompute))
+                stencilCopyPipeline = copy->pipeline;
         }
-        stencilPipeline = GetEdramTransferPipeline(
-            source.kind, dest.kind, source.samples, dest.samples,
-            source.guestSamples, dest.guestSamples,
-            source.pitchTiles, dest.pitchTiles,
-            sourceDepthFloat24, destDepthFloat24, dest.format,
-            EdramTransferPass::StencilBitPlanes);
+        if (!stencilCopyPipeline)
+        {
+            static bool fallbackReported = false;
+            if (!fallbackReported)
+            {
+                fallbackReported = true;
+                KLOG("Vulkan EDRAM depth transfer fallback active: fixed-function stencil bit planes\n");
+            }
+            if (EdramTransferPipeline* planes = GetEdramTransferPipeline(
+                    source.kind, dest.kind, source.samples, dest.samples,
+                    source.guestSamples, dest.guestSamples,
+                    source.pitchTiles, dest.pitchTiles,
+                    sourceDepthFloat24, destDepthFloat24, dest.format,
+                    EdramTransferPass::StencilBitPlanes))
+                stencilBitPlanePipeline = planes->pipeline;
+        }
     }
-    const VkPipeline stencilBitPlanePipeline = stencilPipeline
-        ? stencilPipeline->pipeline : VK_NULL_HANDLE;
     const VkDescriptorSet descriptor = EnsureEdramTransferDescriptor(sourceOwner);
     if (!mainPipeline || !descriptor ||
         (depthTransferMode == mojorecomp::gpu::EdramDepthTransferMode::FixedFunctionBitPlanes &&
-         dest.kind == EdramOwnerKind::Depth && !stencilBitPlanePipeline))
+         dest.kind == EdramOwnerKind::Depth && !stencilBitPlanePipeline && !stencilCopyPipeline))
         return false;
 
     EndColorRendering();
@@ -4916,10 +5278,6 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
     p_vkCmdPushConstants(g_commandBuffer, g_edramTransferPipelineLayout,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
-    const uint32_t tileWidth = EdramTileWidthPixels(dest.guestSamples);
-    const uint32_t tileHeight = EdramTileHeightPixels(dest.guestSamples);
-    const auto rects = EdramTransferRects(destLocalStart, tileCount,
-                                          dest.pitchTiles, tileWidth, tileHeight);
     for (const VkRect2D& rect : rects)
     {
         if (!rect.extent.width || !rect.extent.height)
@@ -4933,6 +5291,7 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
 
     if (stencilBitPlanePipeline)
     {
+        GpuProfileMark(GpuPassCategory::TransferStencil);
         VkClearAttachment clear{};
         clear.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         clear.clearValue.depthStencil.stencil = 0;
@@ -4966,6 +5325,12 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         }
     }
     p_vkCmdEndRendering(g_commandBuffer);
+    if (stencilCopyPipeline)
+    {
+        GpuProfileMark(GpuPassCategory::TransferStencil);
+        RecordEdramStencilCopy(*FindDepthBacking(dest.key), stencilCopyPipeline, descriptor,
+                               source, dest, rects);
+    }
 
     ++g_edramOwnershipTransfers;
     g_edramOwnershipTiles += tileCount;
@@ -13669,8 +14034,10 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     LOAD_DEVICE(vkGetPipelineCacheData);
     LOAD_DEVICE(vkMergePipelineCaches);
     LOAD_DEVICE(vkCreateGraphicsPipelines);
+    LOAD_DEVICE(vkCreateComputePipelines);
     LOAD_DEVICE(vkDestroyPipeline);
     LOAD_DEVICE(vkCmdBindPipeline);
+    LOAD_DEVICE(vkCmdDispatch);
     LOAD_DEVICE(vkCmdSetViewport);
     LOAD_DEVICE(vkCmdSetScissor);
     LOAD_DEVICE(vkCmdSetBlendConstants);
@@ -15516,6 +15883,16 @@ void VkPresenter_Shutdown()
         p_vkDestroyDescriptorPool(g_device, g_edramTransferPool, nullptr);
     if (g_edramTransferSetLayout && p_vkDestroyDescriptorSetLayout)
         p_vkDestroyDescriptorSetLayout(g_device, g_edramTransferSetLayout, nullptr);
+    if (g_edramStencilCopyPipelineLayout && p_vkDestroyPipelineLayout)
+        p_vkDestroyPipelineLayout(g_device, g_edramStencilCopyPipelineLayout, nullptr);
+    if (g_edramStencilCopyPool && p_vkDestroyDescriptorPool)
+        p_vkDestroyDescriptorPool(g_device, g_edramStencilCopyPool, nullptr);
+    if (g_edramStencilCopySetLayout && p_vkDestroyDescriptorSetLayout)
+        p_vkDestroyDescriptorSetLayout(g_device, g_edramStencilCopySetLayout, nullptr);
+    if (g_edramStencilCopyBuffer && p_vkDestroyBuffer)
+        p_vkDestroyBuffer(g_device, g_edramStencilCopyBuffer, nullptr);
+    if (g_edramStencilCopyMemory && p_vkFreeMemory)
+        p_vkFreeMemory(g_device, g_edramStencilCopyMemory, nullptr);
     if (g_overlayPipeline && p_vkDestroyPipeline)
         p_vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
     if (g_overlayVs && p_vkDestroyShaderModule)
@@ -15682,6 +16059,14 @@ void VkPresenter_Shutdown()
     g_edramTransferPool = VK_NULL_HANDLE;
     g_edramTransferPipelineLayout = VK_NULL_HANDLE;
     g_edramTransferVs = VK_NULL_HANDLE;
+    g_edramStencilCopySetLayout = VK_NULL_HANDLE;
+    g_edramStencilCopyPool = VK_NULL_HANDLE;
+    g_edramStencilCopySet = VK_NULL_HANDLE;
+    g_edramStencilCopyPipelineLayout = VK_NULL_HANDLE;
+    g_edramStencilCopyBuffer = VK_NULL_HANDLE;
+    g_edramStencilCopyMemory = VK_NULL_HANDLE;
+    g_edramStencilCopyBytes = 0;
+    g_edramStencilCopyState = 0;
     if (g_device && g_colorView && p_vkDestroyImageView)
         p_vkDestroyImageView(g_device, g_colorView, nullptr);
     if (g_device && g_colorImage && p_vkDestroyImage)

@@ -68,24 +68,25 @@ bool HasRcfExtension(std::string_view path)
            lower(path[at + 2]) == 'c' && lower(path[at + 3]) == 'f';
 }
 
+bool IndirectCallEnvFlag(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") != 0;
 }
 
-extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32_t object)
-{
-    // Keep an exact per-host-thread breadcrumb for the crash reporter. This is
-    // intentionally always-on and extremely cheap; it lets a release build
-    // report the guest indirect target that immediately preceded a host crash
-    // without enabling the much noisier profiling/tracing paths below.
-    g_mojoLastIndirectCallRecord.target = target;
-    g_mojoLastIndirectCallRecord.lr = lr;
-    g_mojoLastIndirectCallRecord.object = object;
-    ++g_mojoLastIndirectCallRecord.sequence;
+// The opt-in indirect-call diagnostics. Every guest virtual call passes
+// through MojoRecompTraceIndirectCall, so read the switches once during static
+// initialization (before any guest code runs) instead of through
+// function-local statics, whose guards cost a thread-local epoch check on
+// every call on the MSVC ABI.
+const bool g_indirectProfileEnabled = IndirectCallEnvFlag("MOJORECOMP_INDIRECT_PROFILE");
+const bool g_saveIndirectTraceEnabled = IndirectCallEnvFlag("MOJORECOMP_SAVE_INDIRECT_TRACE");
+const bool g_indirectCallDiagnosticsEnabled =
+    g_indirectProfileEnabled || g_saveIndirectTraceEnabled;
 
-    static const bool indirectProfile = [] {
-        const char* value = std::getenv("MOJORECOMP_INDIRECT_PROFILE");
-        return value && *value && std::strcmp(value, "0") != 0;
-    }();
-    if (indirectProfile)
+void TraceIndirectCallDiagnostics(uint32_t target, uint32_t lr, uint32_t object)
+{
+    if (g_indirectProfileEnabled)
     {
         struct Sample
         {
@@ -169,17 +170,13 @@ extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32
         }
     }
 
+    if (!g_saveIndirectTraceEnabled || !object)
+        return;
     const bool managerMethod = target == 0x822958A8u || target == 0x822959D8u || target == 0x82296280u;
     const bool stateMethod = target == 0x8228F430u || target == 0x8228F4F8u || target == 0x8228F5B8u ||
                              target == 0x8228F640u || target == 0x8228F7A8u;
     const bool refMethod = target == 0x822926F8u || target == 0x822919C0u;
     if (!managerMethod && !stateMethod && !refMethod)
-        return;
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_SAVE_INDIRECT_TRACE");
-        return value && *value && std::strcmp(value, "0") != 0;
-    }();
-    if (!enabled || !object)
         return;
 
     const auto load32 = [](uint32_t address) -> uint32_t {
@@ -219,6 +216,29 @@ extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32
     KLOG("[save ref] %s target=%08X lr=%08X this=%08X manager=%08X ref(before)=%u tasks=%u open=%u kind=%u\n",
          target == 0x822926F8u ? "AddRef" : "Release", target, lr, object, manager,
          load32(object + 8u), load32(object + 24u), load8(object + 28u), load8(object + 29u));
+}
+
+}
+
+extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32_t object)
+{
+    // Keep an exact per-host-thread breadcrumb for the crash reporter. This is
+    // intentionally always-on and extremely cheap; it lets a release build
+    // report the guest indirect target that immediately preceded a host crash
+    // without enabling the much noisier profiling/tracing paths, which cost
+    // one predictable branch here when they are off.
+    g_mojoLastIndirectCallRecord.target = target;
+    g_mojoLastIndirectCallRecord.lr = lr;
+    g_mojoLastIndirectCallRecord.object = object;
+    ++g_mojoLastIndirectCallRecord.sequence;
+
+    if (g_indirectCallDiagnosticsEnabled) [[unlikely]]
+        TraceIndirectCallDiagnostics(target, lr, object);
+}
+
+extern "C" bool MojoRecompIndirectCallDiagnosticsEnabled()
+{
+    return g_indirectCallDiagnosticsEnabled;
 }
 
 extern "C" void MojoRecompGetLastIndirectCall(uint32_t* target, uint32_t* lr,

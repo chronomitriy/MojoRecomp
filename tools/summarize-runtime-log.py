@@ -36,6 +36,7 @@ POLICY_RE = re.compile(r"frame policy simulation=(?P<sim>\d+)Hz presentation=(?P
 GRAPHICS_RE = re.compile(r"cot-runtime: (?P<text>graphics resolution_scale=.*)$")
 PS_REPLACE_RE = re.compile(r"\[ps-replace\] (?P<text>.*)$")
 FSR_RE = re.compile(r"(?P<text>Vulkan FSR (active|shader compile failed): .*)$")
+STENCIL_RE = re.compile(r"(?P<text>Vulkan EDRAM depth transfer (stencil|fallback active): .*)$")
 GPU_PROFILE_RE = re.compile(r"\[gpu-profile\] frames=\d+ gpu=(?P<gpu>[\d.]+)ms "
                             r"max=(?P<max>[\d.]+)ms \|(?P<categories>[^|]*)\| per frame: "
                             r"(?P<counts>.*?) overflow=(?P<overflow>\d+) malformed=(?P<malformed>\d+)")
@@ -221,12 +222,20 @@ def main(argv: list[str]) -> int:
                                     "seconds": float(m["seconds"]),
                                     "samples": int(m["samples"]), "kinds": pairs(m["kinds"])})
         elif m := GPU_PROFILE_RE.search(line):
+            categories = pairs(m["categories"])
+            # Newer runtimes split EDRAM transfers (transfer-color/-depth/
+            # -stencil); keep the older single "transfer" total comparable.
+            if "transfer" not in categories:
+                split = [v for k, v in categories.items() if k.startswith("transfer-")]
+                if split:
+                    categories["transfer"] = sum(split)
             gpu_profile.append({"gpu": float(m["gpu"]), "max": float(m["max"]),
-                                "categories": pairs(m["categories"]),
+                                "categories": categories,
                                 "counts": pairs(m["counts"]),
                                 "overflow": int(m["overflow"]),
                                 "malformed": int(m["malformed"])})
-        elif m := (GRAPHICS_RE.search(line) or PS_REPLACE_RE.search(line) or FSR_RE.search(line)):
+        elif m := (GRAPHICS_RE.search(line) or PS_REPLACE_RE.search(line) or FSR_RE.search(line)
+                   or STENCIL_RE.search(line)):
             if m["text"] not in phase4_notes:
                 phase4_notes.append(m["text"])
         elif m := PERF_RE.search(line):

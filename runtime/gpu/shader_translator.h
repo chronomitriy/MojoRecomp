@@ -27,6 +27,10 @@ bool CompileHostHlsl(const std::string& hlsl, bool isVs,
                      std::vector<uint8_t>& spirv, std::string& err,
                      bool enableStencilExport = false);
 
+// Same compiler contract for a host compute shader (cs_6_0).
+bool CompileHostComputeHlsl(const std::string& hlsl, std::vector<uint8_t>& spirv,
+                            std::string& err);
+
 // Inject the host-only clip-space aspect transform at XenosRecomp's final
 // vertex-position seam. Kept as a named/testable step so an upstream emitter
 // change cannot silently disable widescreen support.

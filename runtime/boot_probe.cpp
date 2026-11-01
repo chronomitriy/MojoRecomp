@@ -43,6 +43,7 @@ extern "C" void MojoRecompEnsureXmaDevice();
 extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32_t object);
 extern "C" void MojoRecompGetLastIndirectCall(uint32_t* target, uint32_t* lr,
                                               uint32_t* object, uint64_t* sequence);
+extern "C" bool MojoRecompIndirectCallDiagnosticsEnabled();
 #include "kernel/vfs.h"
 #include "kernel/xex_loader.h"
 #include "mojorecomp_version.h"
@@ -515,6 +516,67 @@ int main(int argc, char** argv) {
         crashReporterConfig.outputDirectory = std::filesystem::path(logRoot);
     mojorecomp::host::InitializeCrashReporter(crashReporterConfig);
 #endif
+    if (argc == 2 && std::strcmp(argv[1], "--indirect-call-self-test") == 0) {
+        // Every guest virtual call runs MojoRecompTraceIndirectCall. Its crash
+        // breadcrumb is always on; the opt-in diagnostics must stay off unless
+        // their environment switches are set.
+        const auto envFlag = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value && *value && std::strcmp(value, "0") != 0;
+        };
+        const bool expectDiagnostics = envFlag("MOJORECOMP_INDIRECT_PROFILE") ||
+                                       envFlag("MOJORECOMP_SAVE_INDIRECT_TRACE");
+        if (MojoRecompIndirectCallDiagnosticsEnabled() != expectDiagnostics) {
+            std::fprintf(stderr, "FAIL: indirect-call diagnostics=%d, environment says %d.\n",
+                         int(MojoRecompIndirectCallDiagnosticsEnabled()),
+                         int(expectDiagnostics));
+            return 1;
+        }
+
+        uint64_t sequence0 = 0;
+        MojoRecompGetLastIndirectCall(nullptr, nullptr, nullptr, &sequence0);
+        MojoRecompTraceIndirectCall(0x82001234u, 0x82005678u, 0x40001000u);
+        uint32_t target = 0, lr = 0, object = 0;
+        uint64_t sequence = 0;
+        MojoRecompGetLastIndirectCall(&target, &lr, &object, &sequence);
+        if (target != 0x82001234u || lr != 0x82005678u || object != 0x40001000u ||
+            sequence != sequence0 + 1) {
+            std::fprintf(stderr, "FAIL: breadcrumb %08X/%08X/%08X seq=%llu.\n",
+                         target, lr, object, static_cast<unsigned long long>(sequence));
+            return 2;
+        }
+
+        // The record is per host thread, so the crash reporter names the call
+        // made by the thread that crashed.
+        std::thread other([] { MojoRecompTraceIndirectCall(0x82009990u, 0x8200AAA0u, 0u); });
+        other.join();
+        MojoRecompGetLastIndirectCall(&target, &lr, &object, &sequence);
+        if (target != 0x82001234u || sequence != sequence0 + 1) {
+            std::fprintf(stderr, "FAIL: another thread changed this thread's breadcrumb.\n");
+            return 3;
+        }
+
+        // Cost of the default path (informational). Call through an opaque
+        // pointer, as translated code does, so link-time optimization cannot
+        // inline the call and sink its stores out of the loop.
+        void (*volatile trace)(uint32_t, uint32_t, uint32_t) = MojoRecompTraceIndirectCall;
+        constexpr uint32_t kCalls = 50'000'000u;
+        const auto start = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < kCalls; ++i)
+            trace(0x82000000u + (i & 0xFFFCu), i, i & 0xFFFFu);
+        const double nsPerCall =
+            std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
+                .count() / double(kCalls);
+        MojoRecompGetLastIndirectCall(nullptr, nullptr, nullptr, &sequence);
+        if (sequence != sequence0 + 1 + kCalls) {
+            std::fprintf(stderr, "FAIL: breadcrumb sequence %llu after %u calls.\n",
+                         static_cast<unsigned long long>(sequence), kCalls);
+            return 4;
+        }
+        std::printf("PASS: indirect-call breadcrumb per thread, diagnostics=%d, %.2f ns/call\n",
+                    int(expectDiagnostics), nsPerCall);
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--debug-clock-self-test") == 0) {
         if (!mojorecomp::timebase::Init()) {
             std::fprintf(stderr, "FAIL: debug clock could not initialize host counter.\n");

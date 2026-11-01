@@ -559,6 +559,10 @@ if(BUILD_TESTING AND WIN32)
         COMMAND MojoRecompBootProbe --single-instance-self-test)
     set_tests_properties(RuntimeSingleInstance PROPERTIES TIMEOUT 15 LABELS "host;process")
 
+    add_test(NAME RuntimeIndirectCallBreadcrumb
+        COMMAND MojoRecompBootProbe --indirect-call-self-test)
+    set_tests_properties(RuntimeIndirectCallBreadcrumb PROPERTIES TIMEOUT 15 LABELS "host;crash")
+
     add_test(NAME RuntimeCrashLogPath
         COMMAND MojoRecompBootProbe --crash-log-path-self-test)
     set_tests_properties(RuntimeCrashLogPath PROPERTIES TIMEOUT 15 LABELS "host;logging")
@@ -631,6 +635,11 @@ if(BUILD_TESTING AND WIN32)
     set_tests_properties(FxaaOrientationGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu;postprocess")
     add_test(NAME EdramPairBoundGpuProbe COMMAND MojoRecompTextureGpuProbe --edram-pair-bound)
     set_tests_properties(EdramPairBoundGpuProbe PROPERTIES TIMEOUT 45 LABELS "gpu;edram")
+    add_test(NAME EdramStencilCopyGpuProbe COMMAND MojoRecompTextureGpuProbe --edram-stencil-copy 1)
+    add_test(NAME EdramStencilCopyScale2GpuProbe
+        COMMAND MojoRecompTextureGpuProbe --edram-stencil-copy 2)
+    set_tests_properties(EdramStencilCopyGpuProbe EdramStencilCopyScale2GpuProbe PROPERTIES
+        TIMEOUT 120 LABELS "gpu;edram")
     add_test(NAME FsrEasuGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-easu)
     add_test(NAME FsrRcasGpuProbe COMMAND MojoRecompTextureGpuProbe --fsr-rcas)
     set_tests_properties(FsrEasuGpuProbe FsrRcasGpuProbe PROPERTIES TIMEOUT 45

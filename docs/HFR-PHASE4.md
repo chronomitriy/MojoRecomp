@@ -178,10 +178,14 @@ blocky than 1x bilinear.
 
 `MOJORECOMP_GPU_PROFILE=1` writes a Vulkan timestamp whenever the recorded work changes
 category. The interval up to the next timestamp is charged to the category that started it:
-`scene` (guest draws), `front` (the motion blur pass, by PS hash), `resolve`, `transfer`
-(EDRAM ownership transfers), `clear`, `copy` (texture uploads), `post` (compose + FXAA),
-`fsr`, `present` and `other`. It also counts render passes, resolves, transfers, clears,
-copies, draws and front-pass draws per frame.
+`scene` (guest draws), `front` (the motion blur pass, by PS hash), `resolve`, EDRAM
+ownership transfers (`transfer-color` into color targets, `transfer-depth` for the depth
+pass of a transfer into a depth target, `transfer-stencil` for its stencil part, see
+[6.2](#62-cheaper-stencil-for-edram-depth-transfers)), `clear`, `copy` (texture uploads),
+`post` (compose + FXAA), `fsr`, `present` and `other`. It also counts render passes,
+resolves, transfers (and `depthTransfers` among them), clears, copies, draws and front-pass
+draws per frame. Logs from before the split have a single `transfer=`;
+`summarize-runtime-log.py` prints that total for newer logs too.
 
 Results are read when the frame's fence has signalled, so reading never stalls. Every 120
 frames it logs:
@@ -301,6 +305,52 @@ color/depth layout`.
 F12 traces now also log every EDRAM ownership transfer of the traced frame, with its
 physical tile range. Before, only the first 48 transfers of a session were logged.
 
+### 6.2 Cheaper stencil for EDRAM depth transfers
+
+A 2x profile run (level 2, 120 mode, GTX 1080 Ti) measured 12.43 ms of GPU time per
+frame. EDRAM ownership transfers took 7.55 ms of it: `transfer-stencil` 5.37,
+`transfer-depth` 1.73 and `transfer-color` 0.44. There were 56 transfers per frame, 37 of
+them into depth targets, and the pattern was the same in every window of the run.
+
+The cause is the device, not the transfer count. Without
+`VK_EXT_shader_stencil_export` (this GTX 1080 Ti's driver logs
+`Vulkan shader stencil export: ext=0`), a transfer into a depth target is a depth pass, a
+stencil clear and eight full-screen draws, one per stencil bit. Most of
+these transfers cannot be skipped. The game clears each scene tile through a 4x alias
+rectangle (columns 0-200) plus a 2x rectangle (columns 400-448), so no single draw
+overwrites a whole surface. Its stencil-only clears also keep depth, so those transfers
+must move real scene depth.
+
+- **Change:** the stencil part is now a compute pass that writes the destination's
+  remapped stencil bytes to a scratch buffer, plus one `vkCmdCopyBufferToImage` into the
+  destination's stencil aspect. The compute shader uses the transfer shaders' own
+  address mapping (`MapPhysical`/`LoadPhysical`), so it computes the same byte each
+  bit-plane draw tests one bit of. It runs only for host 1x depth targets (every depth
+  backing) on a queue with compute, and falls back to the bit planes if setup or a
+  pipeline fails.
+- **Off switch:** `MOJORECOMP_EDRAM_STENCIL_COPY=0`.
+- **Log:** `Vulkan EDRAM depth transfer stencil: compute copy, <n> KiB scratch buffer`, or
+  `... fallback active: fixed-function stencil bit planes`. Both reach the run summary.
+- **Test:** `EdramStencilCopyGpuProbe` and `EdramStencilCopyScale2GpuProbe`
+  (`MojoRecompTextureGpuProbe --edram-stencil-copy 1|2`). Each runs six transfers through
+  both paths into the same starting destination: depth and color sources, guest 1x/2x/4x,
+  D24S8 and D32S8, full and partial spans. It requires identical stencil and depth
+  everywhere, an unchanged stencil outside the transferred tiles, and that most of the
+  stencil inside them changed. The other 14 texture-probe tests still pass.
+- **Not verified yet:** in-game fps and the new `transfer-stencil` time (the next run).
+
+### 6.3 Indirect-call hook
+
+The guest profiler put `MojoRecompTraceIndirectCall` at about 1% of the main thread. It
+runs on every guest virtual call. It writes the crash reporter's per-thread breadcrumb,
+which stays on. Its two opt-in diagnostics (`MOJORECOMP_INDIRECT_PROFILE`,
+`MOJORECOMP_SAVE_INDIRECT_TRACE`) were checked through function-local statics: a
+thread-local guard check each, plus ten address compares, on every call. They are now
+read once at startup. The default path is one thread-local lookup, four stores and one
+flag test. `RuntimeIndirectCallBreadcrumb` (`MojoRecompBootProbe --indirect-call-self-test`)
+checks the breadcrumb and the default-off state, and prints the cost (about 1.8 ns per
+call through a function pointer).
+
 ## 7. Test on your PC
 
 Build with `build-smoke.bat` (no recompile is needed: `config\` is unchanged). Each run
@@ -414,6 +464,7 @@ phase 2: [HFR-PHASE2.md 9](HFR-PHASE2.md#9-environment-variables); phase 3:
 | `MOJORECOMP_GUEST_PROFILE_REPORT_S=1..3600` | 15 | Report period |
 | `MOJORECOMP_CUSTOM_SETTINGS=<path>` | beside `settings.toml` | Use this `custom-settings.toml`; startup fails if it is missing |
 | `MOJORECOMP_EDRAM_PAIR_BOUND=0` | on | Size EDRAM surfaces from the frame height only (the pre-fix behaviour of [6.1](#61-blocky-strip-at-the-top-of-the-frame-found-in-play-testing)) |
+| `MOJORECOMP_EDRAM_STENCIL_COPY=0` | on | Use the eight stencil bit-plane draws instead of the compute stencil copy ([6.2](#62-cheaper-stencil-for-edram-depth-transfers)) |
 
 ## 11. Files
 

@@ -23,8 +23,13 @@ enum class GpuPassCategory : uint8_t
     FrontPass,
     // EDRAM resolves into textures.
     Resolve,
-    // EDRAM ownership transfers between surface formats.
+    // EDRAM ownership transfers between surface formats: into color targets,
+    // the depth pass of a transfer into a depth target, and that transfer's
+    // stencil clear and eight bit-plane passes (used when the device lacks
+    // VK_EXT_shader_stencil_export).
     Transfer,
+    TransferDepth,
+    TransferStencil,
     Clear,
     // Texture uploads and their mip generation.
     Copy,
@@ -46,6 +51,8 @@ struct GpuProfileCounts
     uint32_t renderPasses = 0;
     uint32_t resolves = 0;
     uint32_t transfers = 0;
+    // Transfers into a depth target (a subset of transfers).
+    uint32_t depthTransfers = 0;
     uint32_t clears = 0;
     uint32_t copies = 0;
     uint32_t draws = 0;
@@ -94,6 +101,7 @@ private:
     uint64_t renderPasses_ = 0;
     uint64_t resolves_ = 0;
     uint64_t transfers_ = 0;
+    uint64_t depthTransfers_ = 0;
     uint64_t clears_ = 0;
     uint64_t copies_ = 0;
     uint64_t draws_ = 0;

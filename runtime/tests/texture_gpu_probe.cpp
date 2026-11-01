@@ -324,6 +324,348 @@ static void CheckEdramSurfacePairBound()
     std::puts("PASS: a 4x MSAA alias stays within its color/depth EDRAM layout");
 }
 
+struct ProbeBuffer
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint8_t* mapped = nullptr;
+};
+
+static ProbeBuffer CreateProbeBuffer(VkDeviceSize size)
+{
+    ProbeBuffer out;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    Require(p_vkCreateBuffer(g_device, &bi, nullptr, &out.buffer) == VK_SUCCESS, "probe buffer");
+    VkMemoryRequirements req{};
+    p_vkGetBufferMemoryRequirements(g_device, out.buffer, &req);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    Require(ai.memoryTypeIndex != UINT32_MAX &&
+                p_vkAllocateMemory(g_device, &ai, nullptr, &out.memory) == VK_SUCCESS &&
+                p_vkBindBufferMemory(g_device, out.buffer, out.memory, 0) == VK_SUCCESS &&
+                p_vkMapMemory(g_device, out.memory, 0, VK_WHOLE_SIZE, 0,
+                              reinterpret_cast<void**>(&out.mapped)) == VK_SUCCESS,
+            "probe buffer memory");
+    return out;
+}
+
+static void DestroyProbeBuffer(ProbeBuffer& buffer)
+{
+    if (buffer.buffer)
+        p_vkDestroyBuffer(g_device, buffer.buffer, nullptr);
+    if (buffer.memory)
+        p_vkFreeMemory(g_device, buffer.memory, nullptr);
+    buffer = {};
+}
+
+// Submits the open frame's commands and waits, making transfer writes visible
+// to the host. BeginFrame() opens the next one.
+static void SubmitProbeFrame(const char* what)
+{
+    EndColorRendering();
+    VkMemoryBarrier toHost{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+    Require(p_vkEndCommandBuffer(g_commandBuffer) == VK_SUCCESS, what);
+    Require(p_vkResetFences(g_device, 1, &g_fence) == VK_SUCCESS, what);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &g_commandBuffer;
+    Require(p_vkQueueSubmit(g_queue, 1, &submit, g_fence) == VK_SUCCESS, what);
+    Require(p_vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, 10000000000ull) == VK_SUCCESS,
+            what);
+    g_frameOpen = false;
+}
+
+static void CopyDepthAspect(uint64_t key, VkImageAspectFlags aspect, const ProbeBuffer& buffer,
+                            VkDeviceSize offset, bool toImage)
+{
+    DepthBacking* backing = FindDepthBacking(key);
+    Require(backing != nullptr, "probe depth backing");
+    TransitionDepthBacking(*backing, toImage ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                             : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.bufferOffset = offset;
+    region.imageSubresource = {aspect, 0, 0, 1};
+    region.imageExtent = {g_internalExtent.width, g_internalExtent.height, 1};
+    if (toImage)
+        p_vkCmdCopyBufferToImage(g_commandBuffer, buffer.buffer, backing->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    else
+        p_vkCmdCopyImageToBuffer(g_commandBuffer, backing->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1, &region);
+}
+
+struct StencilCopyCase
+{
+    const char* name;
+    EdramOwnerKind sourceKind;
+    uint32_t sourceSurface;
+    uint32_t sourceInfo;
+    uint32_t destSurface;
+    uint32_t destDepthInfo;
+    uint32_t destLocal;
+    uint32_t tiles;
+};
+
+// Runs one depth-target transfer through the eight bit-plane draws and then
+// through the compute copy, into the same starting destination, and requires
+// identical stencil and depth everywhere.
+static void CheckStencilCopyCase(const StencilCopyCase& c, ProbeBuffer& buffer)
+{
+    const uint32_t width = g_internalExtent.width;
+    const uint32_t height = g_internalExtent.height;
+    const VkDeviceSize pixels = VkDeviceSize(width) * height;
+    // [source stencil][source depth or color][dest stencil][dest depth]
+    // [bit-plane stencil][bit-plane depth][compute stencil][compute depth]
+    const VkDeviceSize srcStencil = 0, srcWords = pixels, dstStencil = 5 * pixels,
+                       dstDepth = 6 * pixels, planesStencil = 10 * pixels,
+                       planesDepth = 11 * pixels, copyStencil = 15 * pixels,
+                       copyDepth = 16 * pixels;
+
+    const uint64_t sourceKey = (uint64_t(c.sourceSurface) << 32) | c.sourceInfo;
+    const uint64_t destKey = (uint64_t(c.destSurface) << 32) | c.destDepthInfo;
+    DepthBacking* destBacking = nullptr;
+    Require(CreateDepthBacking(destKey, destBacking), c.name);
+    const bool destD24 = destBacking->format == VK_FORMAT_D24_UNORM_S8_UINT;
+    bool sourceD24 = false;
+    if (c.sourceKind == EdramOwnerKind::Depth)
+    {
+        DepthBacking* sourceBacking = nullptr;
+        Require(CreateDepthBacking(sourceKey, sourceBacking), c.name);
+        sourceD24 = sourceBacking->format == VK_FORMAT_D24_UNORM_S8_UINT;
+    }
+    else
+    {
+        ColorBacking* sourceBacking = nullptr;
+        Require(CreateColorBacking(c.sourceSurface, c.sourceInfo, sourceBacking), c.name);
+    }
+
+    // Per-pixel patterns that exercise every stencil bit.
+    uint8_t* bytes = buffer.mapped;
+    auto* words = reinterpret_cast<uint32_t*>(bytes);
+    for (uint32_t y = 0; y < height; ++y)
+    {
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const VkDeviceSize i = VkDeviceSize(y) * width + x;
+            const uint32_t hash = (x * 0x9E3779B1u) ^ (y * 0x85EBCA77u) ^ (x >> 3) ^ (y << 5);
+            bytes[srcStencil + i] = uint8_t(hash >> 11);
+            if (c.sourceKind == EdramOwnerKind::Depth)
+            {
+                const float depth = float((hash >> 8) % 1000u) / 1000.0f;
+                uint32_t value = 0;
+                if (sourceD24)
+                    value = uint32_t(depth * 16777215.0f);
+                else
+                    std::memcpy(&value, &depth, sizeof(value));
+                words[srcWords / 4 + i] = value;
+            }
+            else
+            {
+                words[srcWords / 4 + i] = hash * 0x2545F491u;
+            }
+            bytes[dstStencil + i] = uint8_t((x ^ y ^ 0x5Au) & 255u);
+            const float garbageDepth = 0.25f;
+            uint32_t value = 0x00400000u;
+            if (!destD24)
+                std::memcpy(&value, &garbageDepth, sizeof(value));
+            words[dstDepth / 4 + i] = value;
+        }
+    }
+
+    const EdramOwner sourceOwner{c.sourceKind, sourceKey};
+    const EdramOwner destOwner{EdramOwnerKind::Depth, destKey};
+    Require(BeginFrame(), c.name);
+    if (c.sourceKind == EdramOwnerKind::Depth)
+    {
+        CopyDepthAspect(sourceKey, VK_IMAGE_ASPECT_STENCIL_BIT, buffer, srcStencil, true);
+        CopyDepthAspect(sourceKey, VK_IMAGE_ASPECT_DEPTH_BIT, buffer, srcWords, true);
+    }
+    else
+    {
+        ColorBacking* source = FindColorBacking(sourceKey);
+        Require(source != nullptr, c.name);
+        TransitionColorBacking(*source, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.bufferOffset = srcWords;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {width, height, 1};
+        p_vkCmdCopyBufferToImage(g_commandBuffer, buffer.buffer, source->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+
+    const auto runPath = [&](bool compute, VkDeviceSize stencilOut, VkDeviceSize depthOut) {
+        CopyDepthAspect(destKey, VK_IMAGE_ASPECT_STENCIL_BIT, buffer, dstStencil, true);
+        CopyDepthAspect(destKey, VK_IMAGE_ASPECT_DEPTH_BIT, buffer, dstDepth, true);
+        g_edramStencilCopyState = compute ? 1 : -1;
+        Require(TransferEdramOwnershipSpan(sourceOwner, destOwner, c.destLocal, c.tiles),
+                c.name);
+        CopyDepthAspect(destKey, VK_IMAGE_ASPECT_STENCIL_BIT, buffer, stencilOut, false);
+        CopyDepthAspect(destKey, VK_IMAGE_ASPECT_DEPTH_BIT, buffer, depthOut, false);
+    };
+    runPath(false, planesStencil, planesDepth);
+    runPath(true, copyStencil, copyDepth);
+    SubmitProbeFrame(c.name);
+
+    // The rectangles the transfer may write, in host pixels.
+    EdramBackingMeta dest{};
+    Require(GetEdramBackingMeta(destOwner, dest), c.name);
+    std::vector<uint8_t> inside(size_t(pixels), 0);
+    for (const VkRect2D& rect : EdramTransferRects(c.destLocal, c.tiles, dest.pitchTiles,
+                                                   EdramTileWidthPixels(dest.guestSamples),
+                                                   EdramTileHeightPixels(dest.guestSamples)))
+    {
+        const VkRect2D host = EdramStencilCopyHostRect(rect);
+        for (uint32_t y = 0; y < host.extent.height; ++y)
+            for (uint32_t x = 0; x < host.extent.width; ++x)
+                inside[size_t(host.offset.y + y) * width + host.offset.x + x] = 1;
+    }
+
+    const uint32_t depthMask = destD24 ? 0x00FFFFFFu : 0xFFFFFFFFu;
+    uint64_t insideCount = 0, changed = 0;
+    for (VkDeviceSize i = 0; i < pixels; ++i)
+    {
+        const uint8_t planes = bytes[planesStencil + i];
+        const uint8_t copy = bytes[copyStencil + i];
+        if (planes != copy)
+        {
+            std::fprintf(stderr, "%s: pixel %llu,%llu stencil bit planes=%02X compute=%02X\n",
+                         c.name, static_cast<unsigned long long>(i % width),
+                         static_cast<unsigned long long>(i / width), planes, copy);
+            Require(false, "the compute copy must write the bit-plane stencil");
+        }
+        if ((words[planesDepth / 4 + i] & depthMask) != (words[copyDepth / 4 + i] & depthMask))
+            Require(false, "the stencil copy must leave the transferred depth unchanged");
+        if (inside[size_t(i)])
+        {
+            ++insideCount;
+            changed += copy != bytes[dstStencil + i];
+        }
+        else if (copy != bytes[dstStencil + i])
+        {
+            Require(false, "the stencil outside the transferred tiles must stay unchanged");
+        }
+    }
+    Require(insideCount != 0 && changed * 2 > insideCount,
+            "the transfer must replace most of the destination stencil");
+    std::printf("  ok: %s (scale %u, %llu pixels, %s -> %s)\n", c.name, g_resolutionScale,
+                static_cast<unsigned long long>(insideCount),
+                c.sourceKind == EdramOwnerKind::Color ? "color" : (sourceD24 ? "D24S8" : "D32S8"),
+                destD24 ? "D24S8" : "D32S8");
+}
+
+static void CheckEdramStencilCopy(uint32_t scale)
+{
+    static constexpr StencilCopyCase kCases[] = {
+        {"2x depth -> 4x alias depth, all tiles", EdramOwnerKind::Depth,
+         0x078101E0u, 0x0001021Cu, 0x03C200F0u, 0x0001021Cu, 0, 540},
+        {"4x alias depth -> 2x depth, partial rows", EdramOwnerKind::Depth,
+         0x03C200F0u, 0x0001021Cu, 0x078101E0u, 0x0001021Cu, 7, 200},
+        {"2x color -> 4x alias unorm depth", EdramOwnerKind::Color,
+         0x078101E0u, 0x00000438u, 0x03C200F0u, 0x00000438u, 0, 540},
+        {"2x unorm depth -> 4x alias float depth", EdramOwnerKind::Depth,
+         0x078101E0u, 0x0000021Cu, 0x03C200F0u, 0x0001021Cu, 13, 401},
+        {"1x depth -> 4x alias depth, partial rows", EdramOwnerKind::Depth,
+         0x14000500u, 0x000102D0u, 0x0A020280u, 0x000102D0u, 3, 100},
+        {"4x alias depth -> 1x depth, partial rows", EdramOwnerKind::Depth,
+         0x0A020280u, 0x000102D0u, 0x14000500u, 0x000102D0u, 100, 333},
+    };
+    {
+        mojorecomp::config::RuntimeConfig config{};
+        config.resolutionScale = scale;
+        mojorecomp::config::Set(config);
+        Require(HostWindow_Init(1280, 720, true), "hidden stencil copy window");
+        Require(VkPresenter_Init(HostWindow_NativeHandle(), 1280, 720), "stencil copy presenter");
+        Require(g_resolutionScale == scale, "resolution scale");
+        // Both stencil paths replace stencil export; force them on any device.
+        g_shaderStencilExport = false;
+        Require(EnsureEdramStencilCopyInfrastructure(), "stencil copy infrastructure");
+        ProbeBuffer buffer = CreateProbeBuffer(VkDeviceSize(20) * g_internalExtent.width *
+                                               g_internalExtent.height);
+        for (const StencilCopyCase& c : kCases)
+            CheckStencilCopyCase(c, buffer);
+        bool sawCompute = false, sawPlanes = false;
+        for (const EdramTransferPipeline& rec : g_edramTransferPipelines)
+        {
+            sawCompute |= rec.pass == EdramTransferPass::StencilCopyCompute && rec.pipeline;
+            sawPlanes |= rec.pass == EdramTransferPass::StencilBitPlanes && rec.pipeline;
+        }
+        Require(sawCompute && sawPlanes, "both stencil paths must have run");
+        DestroyProbeBuffer(buffer);
+        VkPresenter_Shutdown();
+    }
+    std::printf("PASS: the compute stencil copy matches the stencil bit planes exactly "
+                "(scale %u)\n", scale);
+}
+
+// Informational (not a CTest): GPU time of a 540-tile depth transfer at scale 2,
+// with the stencil bit planes and with the compute stencil copy.
+static void BenchEdramStencilCopy()
+{
+    mojorecomp::config::RuntimeConfig config{};
+    config.resolutionScale = 2;
+    mojorecomp::config::Set(config);
+    Require(HostWindow_Init(1280, 720, true), "bench window");
+    Require(VkPresenter_Init(HostWindow_NativeHandle(), 1280, 720), "bench presenter");
+    g_shaderStencilExport = false;
+    Require(EnsureEdramStencilCopyInfrastructure(), "bench infrastructure");
+    const uint64_t key2x = (uint64_t(0x078101E0u) << 32) | 0x0001021Cu;
+    const uint64_t key4x = (uint64_t(0x03C200F0u) << 32) | 0x0001021Cu;
+    DepthBacking* backing = nullptr;
+    Require(CreateDepthBacking(key2x, backing) && CreateDepthBacking(key4x, backing), "bench backings");
+    const EdramOwner owner2x{EdramOwnerKind::Depth, key2x};
+    const EdramOwner owner4x{EdramOwnerKind::Depth, key4x};
+
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 4;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    Require(p_vkCreateQueryPool(g_device, &qi, nullptr, &pool) == VK_SUCCESS, "bench queries");
+    constexpr uint32_t kRounds = 16;
+    const char* names[2] = {"stencil bit planes", "compute stencil copy"};
+    for (uint32_t pass = 0; pass < 2; ++pass)  // pass 0 warms pipelines and caches
+    {
+        Require(BeginFrame(), "bench frame");
+        p_vkCmdResetQueryPool(g_commandBuffer, pool, 0, 4);
+        for (uint32_t mode = 0; mode < 2; ++mode)
+        {
+            g_edramStencilCopyState = mode == 0 ? -1 : 1;
+            p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool,
+                                  mode * 2);
+            for (uint32_t i = 0; i < kRounds; ++i)
+            {
+                Require(TransferEdramOwnershipSpan(owner2x, owner4x, 0, 540), "bench 2x->4x");
+                Require(TransferEdramOwnershipSpan(owner4x, owner2x, 0, 540), "bench 4x->2x");
+            }
+            p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool,
+                                  mode * 2 + 1);
+        }
+        SubmitProbeFrame("bench submit");
+        uint64_t ticks[4]{};
+        Require(p_vkGetQueryPoolResults(g_device, pool, 0, 4, sizeof(ticks), ticks,
+                                        sizeof(uint64_t),
+                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+                    VK_SUCCESS,
+                "bench results");
+        if (pass == 0)
+            continue;
+        for (uint32_t mode = 0; mode < 2; ++mode)
+            std::printf("  %-24s %7.1f us per depth transfer\n", names[mode],
+                        double(ticks[mode * 2 + 1] - ticks[mode * 2]) * g_gpuTimestampPeriodNs /
+                            1000.0 / (2.0 * kRounds));
+    }
+    p_vkDestroyQueryPool(g_device, pool, nullptr);
+    VkPresenter_Shutdown();
+}
+
 static void CheckPixels(bool dummy, bool rectangle = false, bool tiledResolve = false)
 {
     EndColorRendering();
@@ -718,6 +1060,16 @@ int main(int argc, char** argv)
         if (argc == 2 && std::string_view(argv[1]) == "--edram-pair-bound")
         {
             CheckEdramSurfacePairBound();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--edram-stencil-copy-bench")
+        {
+            BenchEdramStencilCopy();
+            return 0;
+        }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--edram-stencil-copy")
+        {
+            CheckEdramStencilCopy(argc == 3 ? uint32_t(std::stoul(argv[2])) : 1u);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resolve-rect-cpu")

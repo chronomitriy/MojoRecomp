@@ -73,6 +73,26 @@ struct HostShaderCacheStamp
 
 std::mutex g_hostShaderCacheIoMutex;
 
+// Host helper shader stages. The numbers are part of the disk-cache key and
+// stamp; vertex and pixel keep their original values.
+enum class HostShaderStage : uint32_t
+{
+    Vertex = 1,
+    Pixel = 2,
+    Compute = 3,
+};
+
+const char* HostShaderStageName(HostShaderStage stage)
+{
+    switch (stage)
+    {
+        case HostShaderStage::Vertex: return "vs";
+        case HostShaderStage::Pixel: return "ps";
+        case HostShaderStage::Compute: return "cs";
+    }
+    return "ps";
+}
+
 uint64_t HostShaderHashBytes(uint64_t hash, const void* data, size_t size)
 {
     const auto* bytes = static_cast<const uint8_t*>(data);
@@ -84,16 +104,16 @@ uint64_t HostShaderHashBytes(uint64_t hash, const void* data, size_t size)
     return hash;
 }
 
-uint64_t HostShaderCacheKey(const std::string& hlsl, bool isVs,
+uint64_t HostShaderCacheKey(const std::string& hlsl, HostShaderStage stage,
                             bool enableStencilExport)
 {
     uint64_t hash = 0xCBF29CE484222325ull;
     static constexpr char kCompilerContract[] =
         "dxc-sm6-hv2021-spirv-vkdxlayout-stripdebug";
     hash = HostShaderHashBytes(hash, kCompilerContract, sizeof(kCompilerContract) - 1);
-    const uint8_t stage = isVs ? 1u : 2u;
+    const uint8_t stageId = static_cast<uint8_t>(stage);
     const uint8_t stencil = enableStencilExport ? 1u : 0u;
-    hash = HostShaderHashBytes(hash, &stage, sizeof(stage));
+    hash = HostShaderHashBytes(hash, &stageId, sizeof(stageId));
     hash = HostShaderHashBytes(hash, &stencil, sizeof(stencil));
     if (const char* extra = std::getenv("MOJORECOMP_DXC_DEFINES"); extra && *extra)
         hash = HostShaderHashBytes(hash, extra, std::strlen(extra));
@@ -112,13 +132,13 @@ std::filesystem::path HostShaderCacheDir()
     return HostPaths::ExeDir() / "cache" / "host-shaders" / kHostShaderCacheVersion;
 }
 
-bool LoadHostShaderCache(const std::string& hlsl, bool isVs,
+bool LoadHostShaderCache(const std::string& hlsl, HostShaderStage stage,
                          bool enableStencilExport, uint64_t keyHash,
                          std::vector<uint8_t>& spirv)
 {
     char stem[64]{};
     std::snprintf(stem, sizeof(stem), "%s-%016llx-%s",
-                  isVs ? "vs" : "ps",
+                  HostShaderStageName(stage),
                   static_cast<unsigned long long>(keyHash),
                   enableStencilExport ? "stencil" : "plain");
     const auto dir = HostShaderCacheDir();
@@ -133,7 +153,7 @@ bool LoadHostShaderCache(const std::string& hlsl, bool isVs,
         stamp.schema != kHostShaderCacheSchema ||
         stamp.hlslSize != hlsl.size() ||
         stamp.keyHash != keyHash ||
-        stamp.stage != (isVs ? 1u : 2u) ||
+        stamp.stage != static_cast<uint32_t>(stage) ||
         stamp.stencilExport != (enableStencilExport ? 1u : 0u))
         return false;
 
@@ -160,7 +180,7 @@ bool LoadHostShaderCache(const std::string& hlsl, bool isVs,
     return true;
 }
 
-void StoreHostShaderCache(const std::string& hlsl, bool isVs,
+void StoreHostShaderCache(const std::string& hlsl, HostShaderStage stage,
                           bool enableStencilExport, uint64_t keyHash,
                           const std::vector<uint8_t>& spirv)
 {
@@ -168,7 +188,7 @@ void StoreHostShaderCache(const std::string& hlsl, bool isVs,
         return;
     char stem[64]{};
     std::snprintf(stem, sizeof(stem), "%s-%016llx-%s",
-                  isVs ? "vs" : "ps",
+                  HostShaderStageName(stage),
                   static_cast<unsigned long long>(keyHash),
                   enableStencilExport ? "stencil" : "plain");
     const auto dir = HostShaderCacheDir();
@@ -182,7 +202,7 @@ void StoreHostShaderCache(const std::string& hlsl, bool isVs,
     HostShaderCacheStamp stamp{};
     stamp.hlslSize = static_cast<uint32_t>(hlsl.size());
     stamp.keyHash = keyHash;
-    stamp.stage = isVs ? 1u : 2u;
+    stamp.stage = static_cast<uint32_t>(stage);
     stamp.stencilExport = enableStencilExport ? 1u : 0u;
 
     std::lock_guard<std::mutex> lock(g_hostShaderCacheIoMutex);
@@ -950,7 +970,7 @@ static std::wstring Widen(const std::string& s)
     return w;
 }
 
-static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag,
+static bool CompileSpirv(const std::string& hlsl, HostShaderStage stage, uint32_t tag,
                          std::vector<uint8_t>& spv, std::string& err,
                          bool enableStencilExport = false)
 {
@@ -959,7 +979,8 @@ static bool CompileSpirv(const std::string& hlsl, bool isVs, uint32_t tag,
         return false;
 
     std::vector<std::wstring> args = {
-        L"-T", isVs ? L"vs_6_0" : L"ps_6_0",
+        L"-T", stage == HostShaderStage::Vertex ? L"vs_6_0"
+               : stage == HostShaderStage::Compute ? L"cs_6_0" : L"ps_6_0",
         L"-HV", L"2021",
         L"-all-resources-bound",
         // Do not use -fvk-invert-y: the renderer already folds the D3D-style
@@ -1196,19 +1217,37 @@ static bool LinearizeKnownForwardLightingPs(const std::string& name, std::string
 }
 } // namespace
 
+namespace {
+
+bool CompileHostStageHlsl(const std::string& hlsl, HostShaderStage stage,
+                          std::vector<uint8_t>& spirv, std::string& err,
+                          bool enableStencilExport)
+{
+    const uint64_t keyHash = HostShaderCacheKey(hlsl, stage, enableStencilExport);
+    if (LoadHostShaderCache(hlsl, stage, enableStencilExport, keyHash, spirv))
+        return true;
+
+    if (!CompileSpirv(hlsl, stage, 0x4D53u, spirv, err, enableStencilExport))
+        return false;
+
+    StoreHostShaderCache(hlsl, stage, enableStencilExport, keyHash, spirv);
+    return true;
+}
+
+} // namespace
+
 bool CompileHostHlsl(const std::string& hlsl, bool isVs,
                      std::vector<uint8_t>& spirv, std::string& err,
                      bool enableStencilExport)
 {
-    const uint64_t keyHash = HostShaderCacheKey(hlsl, isVs, enableStencilExport);
-    if (LoadHostShaderCache(hlsl, isVs, enableStencilExport, keyHash, spirv))
-        return true;
+    return CompileHostStageHlsl(hlsl, isVs ? HostShaderStage::Vertex : HostShaderStage::Pixel,
+                                spirv, err, enableStencilExport);
+}
 
-    if (!CompileSpirv(hlsl, isVs, 0x4D53u, spirv, err, enableStencilExport))
-        return false;
-
-    StoreHostShaderCache(hlsl, isVs, enableStencilExport, keyHash, spirv);
-    return true;
+bool CompileHostComputeHlsl(const std::string& hlsl, std::vector<uint8_t>& spirv,
+                            std::string& err)
+{
+    return CompileHostStageHlsl(hlsl, HostShaderStage::Compute, spirv, err, false);
 }
 
 bool ApplyHostVertexAspectTransform(std::string& hlsl)
@@ -1280,7 +1319,8 @@ bool Translate(const std::string& name, const uint8_t* ucode, size_t size,
     if (!BuildMetaJson(isVs, u, tfSorted, aluLits, aluDyn, out.metaJson, err))
         return false;
 
-    return CompileSpirv(out.hlsl, isVs, tag, out.spirv, err);
+    return CompileSpirv(out.hlsl, isVs ? HostShaderStage::Vertex : HostShaderStage::Pixel,
+                        tag, out.spirv, err);
 }
 
 bool WritePair(const std::filesystem::path& outDir, const std::string& name,

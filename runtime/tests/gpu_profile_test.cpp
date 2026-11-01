@@ -102,6 +102,26 @@ int main()
     if (accumulator.Frames() != 0 || accumulator.ReportDue())
         return Fail("FormatAndReset must start a new window");
 
+    // EDRAM transfers are split: into color, the depth pass into depth, and
+    // the stencil clear plus bit-plane passes of that depth transfer.
+    GpuProfileFrame transfers;
+    transfers.categories = {GpuPassCategory::Transfer, GpuPassCategory::TransferDepth,
+                            GpuPassCategory::TransferStencil, GpuPassCategory::Scene};
+    transfers.timestamps = {0, 5, 7, 25, 26};
+    transfers.counts.transfers = 2;
+    transfers.counts.depthTransfers = 1;
+    GpuProfileAccumulator split(1);
+    split.AddFrame(transfers, 64, 1.0e6);
+    const std::string splitLine = split.FormatAndReset();
+    if (!Contains(splitLine, " transfer-color=5.000") ||
+        !Contains(splitLine, " transfer-depth=2.000") ||
+        !Contains(splitLine, " transfer-stencil=18.000") ||
+        !Contains(splitLine, "transfers=2.0 depthTransfers=1.0"))
+    {
+        std::fprintf(stderr, "%s\n", splitLine.c_str());
+        return Fail("transfer segments must be reported per kind");
+    }
+
     std::puts("PASS: GPU profile segments, timestamp wrap, malformed frames and report averages.");
     return 0;
 }
